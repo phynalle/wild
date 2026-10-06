@@ -94,6 +94,8 @@ object = { version = "0.40.0", default-features = false, features = [
   # Note that compression is only actually needed for linker-diff
   "compression",
   "elf",
+  "coff",
+  "pe",
   "macho",
   "read_core",
   "std",

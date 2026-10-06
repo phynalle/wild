@@ -34,6 +34,16 @@ pub struct CoffArgs {
     pub(crate) excluded_default_libraries: Vec<String>,
     /// Set by a bare `/NODEFAULTLIB`, which ignores every default library.
     pub(crate) no_default_libraries: bool,
+    pub(crate) directives: Vec<String>,
+    pub(crate) image_base: u64,
+    pub(crate) stack: (u64, u64),
+    pub(crate) heap: (u64, u64),
+    pub(crate) gc: bool,
+    pub(crate) nx_compat: bool,
+    pub(crate) dynamic_base: bool,
+    pub(crate) high_entropy_va: bool,
+    pub(crate) large_address_aware: bool,
+    pub(crate) subsystem_version: (u16, u16),
 }
 
 impl CoffArgs {
@@ -57,6 +67,16 @@ impl Default for CoffArgs {
             default_libraries: Vec::new(),
             excluded_default_libraries: Vec::new(),
             no_default_libraries: false,
+            directives: Vec::new(),
+            image_base: 0x140000000,
+            stack: (1024 * 1024, 4096),
+            heap: (1024 * 1024, 4096),
+            gc: true,
+            nx_compat: true,
+            dynamic_base: true,
+            high_entropy_va: true,
+            large_address_aware: true,
+            subsystem_version: (6, 0),
         }
     }
 }
@@ -71,7 +91,7 @@ impl platform::Args for CoffArgs {
     }
 
     fn should_strip_debug(&self) -> bool {
-        todo!()
+        true
     }
 
     fn should_strip_all(&self) -> bool {
@@ -102,25 +122,23 @@ impl platform::Args for CoffArgs {
     }
 
     fn should_export_all_dynamic_symbols(&self) -> bool {
-        todo!()
+        false
     }
 
     fn should_export_dynamic(&self, _lib_name: &[u8]) -> bool {
-        todo!()
+        false
     }
 
     fn loadable_segment_alignment(&self) -> crate::alignment::Alignment {
-        todo!()
+        crate::alignment::Alignment { exponent: 12 }
     }
 
     fn should_merge_sections(&self) -> bool {
-        // TODO
-        true
+        !self.is_dll
     }
 
     fn should_output_executable(&self) -> bool {
-        // TODO
-        true
+        !self.is_dll
     }
 
     fn is_ignored_flag(&self, flag: &str) -> bool {
@@ -133,12 +151,11 @@ impl platform::Args for CoffArgs {
 }
 
 // Parse the supplied input arguments, which should not include the program name.
-pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(
-    args: &mut CoffArgs,
-    mut input: I,
-) -> Result {
+pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut CoffArgs, input: I) -> Result {
     let mut modifier_stack = vec![Modifiers::default()];
-
+    let raw: Vec<_> = input.map(|s| s.as_ref().to_owned()).collect();
+    let expanded = expand_response_files(&raw, &mut Vec::new())?;
+    let mut input = expanded.iter();
     let arg_parser = setup_argument_parser();
     while let Some(arg) = input.next() {
         let arg = arg.as_ref();
@@ -149,6 +166,29 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(
     args.common.report_unrecognized()?;
 
     Ok(())
+}
+
+fn expand_response_files(
+    input: &[String],
+    stack: &mut Vec<std::path::PathBuf>,
+) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for arg in input {
+        if let Some(path) = arg.strip_prefix('@') {
+            let path = std::fs::canonicalize(path)?;
+            crate::ensure!(
+                stack.len() < 32 && !stack.contains(&path),
+                "Response-file cycle or nesting limit at {}",
+                path.display()
+            );
+            stack.push(path.clone());
+            out.extend(expand_response_files(&read_response_file(&path)?, stack)?);
+            stack.pop();
+        } else {
+            out.push(arg.clone());
+        }
+    }
+    Ok(out)
 }
 
 /// link.exe spells its options differently to the GNU-style linkers: names are case-insensitive,
@@ -170,18 +210,12 @@ const SILENTLY_IGNORED_FLAGS: &[&str] = &[
     "pdb",
     "pdbaltpath",
     "natvis",
-    // Optimisations we don't implement, e.g. `/OPT:REF,NOICF`.
-    "opt",
     // Manifest generation and warnings-as-errors, e.g. `/MANIFEST:EMBED`, `/MANIFESTUAC:NO`,
     // `/MANIFESTINPUT:foo.manifest`, `/WX:NO`.
     "manifest",
     "manifestinput",
     "manifestuac",
     "wx",
-    // Take an optional `:NO` value, e.g. `/NXCOMPAT:NO`. These request PE header bits that we
-    // don't emit yet, so ignoring them doesn't change the set of linked inputs.
-    "nxcompat",
-    "dynamicbase",
 ];
 
 /// Options that we accept but that change either the output or the set of linked inputs when
@@ -194,10 +228,7 @@ const IGNORED_FLAGS: &[&str] = &[
     // value requests exactly what we do.
     "guard",
     // An import library and a module definition file, which we don't produce.
-    "implib",
-    "def",
-    // Changes which archive members get linked, e.g. `/WHOLEARCHIVE:foo.lib`.
-    "wholearchive",
+    "implib", "def",
 ];
 
 /// Ignored options that take no value, so `/NOLOGO:x` is an error just like `/DLL:x` is.
@@ -230,6 +261,10 @@ fn setup_argument_parser() -> ArgumentParser<CoffArgs> {
         .help("Set the subsystem, optionally with a version")
         .execute(|args, _modifier_stack, value| {
             args.subsystem = Some(parse_subsystem(value)?);
+            if let Some((_, version)) = value.split_once(',') {
+                let (major, minor) = version.split_once('.').unwrap_or((version, "0"));
+                args.subsystem_version = (major.parse()?, minor.parse()?);
+            }
             Ok(())
         });
 
@@ -306,6 +341,196 @@ fn setup_argument_parser() -> ArgumentParser<CoffArgs> {
     add_silently_ignored_flags(&mut parser);
 
     parser
+        .declare()
+        .long("-version")
+        .long("version")
+        .execute(|args, _| {
+            args.common.version_mode = crate::args::VersionMode::ExitAfterPrint;
+            Ok(())
+        });
+    parser
+        .declare_with_optional_param()
+        .long("nxcompat")
+        .execute(|args, _, value| {
+            args.nx_compat = parse_boolean(value)?;
+            Ok(())
+        });
+    parser
+        .declare_with_optional_param()
+        .long("dynamicbase")
+        .execute(|args, _, value| {
+            args.dynamic_base = parse_boolean(value)?;
+            Ok(())
+        });
+    parser
+        .declare_with_optional_param()
+        .long("highentropyva")
+        .execute(|args, _, value| {
+            args.high_entropy_va = parse_boolean(value)?;
+            Ok(())
+        });
+    parser
+        .declare_with_optional_param()
+        .long("largeaddressaware")
+        .execute(|args, _, value| {
+            args.large_address_aware = parse_boolean(value)?;
+            Ok(())
+        });
+
+    macro_rules! directive {
+        ($flag:literal) => {
+            parser
+                .declare_with_param()
+                .long($flag)
+                .execute(|args, _, value| {
+                    args.directives
+                        .push(format!(concat!("/", $flag, ":{}"), value));
+                    Ok(())
+                });
+        };
+    }
+    directive!("include");
+    directive!("alternatename");
+    directive!("failifmismatch");
+    directive!("merge");
+    directive!("section");
+    parser
+        .declare_with_optional_param()
+        .long("wholearchive")
+        .execute(|args, _, value| {
+            args.directives.push(
+                value.map_or_else(|| "/wholearchive".into(), |v| format!("/wholearchive:{v}")),
+            );
+            Ok(())
+        });
+    parser
+        .declare_with_param()
+        .long("opt")
+        .execute(|args, _, value| {
+            for option in value.split(',') {
+                match option.to_ascii_lowercase().as_str() {
+                    "ref" => args.gc = true,
+                    "noref" => args.gc = false,
+                    "noicf" | "icf" => {}
+                    _ => bail!("Unsupported /OPT value {option}"),
+                }
+            }
+            Ok(())
+        });
+    parser
+        .declare_with_param()
+        .long("base")
+        .execute(|args, _, value| {
+            args.image_base = crate::args::parse_number(value)?;
+            Ok(())
+        });
+    parser
+        .declare_with_param()
+        .long("stack")
+        .execute(|args, _, value| {
+            args.stack = parse_reserve_commit(value)?;
+            Ok(())
+        });
+    parser
+        .declare_with_param()
+        .long("heap")
+        .execute(|args, _, value| {
+            args.heap = parse_reserve_commit(value)?;
+            Ok(())
+        });
+    for flag in ["incremental", "brepro"] {
+        parser
+            .declare_with_optional_param()
+            .long(flag)
+            .execute(|_, _, _| Ok(()));
+    }
+    parser.declare().long("release").execute(|_, _| Ok(()));
+
+    parser
+}
+
+fn parse_boolean(value: Option<&str>) -> Result<bool> {
+    match value {
+        None => Ok(true),
+        Some(v) if v.eq_ignore_ascii_case("no") => Ok(false),
+        _ => bail!("Expected a bare option or :NO"),
+    }
+}
+
+fn parse_reserve_commit(value: &str) -> Result<(u64, u64)> {
+    let (reserve, commit) = value.split_once(',').unwrap_or((value, "4096"));
+    let reserve = crate::args::parse_number(reserve)?;
+    let commit = crate::args::parse_number(commit)?;
+    crate::ensure!(commit <= reserve, "Commit exceeds reserve");
+    Ok((reserve, commit))
+}
+
+pub(crate) fn read_response_file(path: &Path) -> Result<Vec<String>> {
+    let bytes = std::fs::read(path)?;
+    let text = if bytes.starts_with(&[0xff, 0xfe]) {
+        crate::ensure!(
+            bytes.len() % 2 == 0,
+            "Truncated UTF-16 response file {}",
+            path.display()
+        );
+        String::from_utf16(
+            &bytes[2..]
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect::<Vec<_>>(),
+        )?
+    } else {
+        std::str::from_utf8(&bytes)?
+            .trim_start_matches('\u{feff}')
+            .to_owned()
+    };
+    split_windows_args(&text)
+}
+
+/// MSVC response files use the Windows backslash-before-quote convention.
+pub(crate) fn split_windows_args(input: &str) -> Result<Vec<String>> {
+    let mut args = Vec::new();
+    let mut arg = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            let mut count = 1;
+            while chars.peek() == Some(&'\\') {
+                chars.next();
+                count += 1;
+            }
+            if chars.peek() == Some(&'"') {
+                arg.extend(std::iter::repeat_n('\\', count / 2));
+                chars.next();
+                if count % 2 == 1 {
+                    arg.push('"');
+                } else {
+                    quoted = !quoted;
+                }
+            } else {
+                arg.extend(std::iter::repeat_n('\\', count));
+            }
+            started = true;
+        } else if c == '"' {
+            quoted = !quoted;
+            started = true;
+        } else if c.is_whitespace() && !quoted {
+            if started {
+                args.push(std::mem::take(&mut arg));
+                started = false;
+            }
+        } else {
+            arg.push(c);
+            started = true;
+        }
+    }
+    crate::ensure!(!quoted, "Unclosed quote in Windows arguments");
+    if started {
+        args.push(arg);
+    }
+    Ok(args)
 }
 
 fn add_silently_ignored_flags(parser: &mut ArgumentParser<CoffArgs>) {
@@ -641,8 +866,6 @@ mod tests {
             "/DEBUG:FULL",
             "/IMPLIB:out.lib",
             "/DEF:exports.def",
-            "/WHOLEARCHIVE",
-            "/WHOLEARCHIVE:foo.lib",
             "/guard:cf",
         ];
 
@@ -666,8 +889,8 @@ mod tests {
     /// the value and has to rebuild the name in canonical form.
     #[test]
     fn warnings_quote_the_users_spelling_except_for_debug() {
-        let (_args, warnings) = parse_capturing_warnings(["/wholearchive:Foo.lib"]);
-        assert_eq!(warnings, ["/wholearchive:Foo.lib is not yet supported"]);
+        let (_args, warnings) = parse_capturing_warnings(["/implib:Foo.lib"]);
+        assert_eq!(warnings, ["/implib:Foo.lib is not yet supported"]);
 
         let (_args, warnings) = parse_capturing_warnings(["/debug:full"]);
         assert_eq!(warnings, ["/DEBUG:full is not yet supported"]);
@@ -675,9 +898,9 @@ mod tests {
 
     #[test]
     fn unsupported_options_warn_with_a_dash_prefix() {
-        let (_args, warnings) = parse_capturing_warnings(["-WHOLEARCHIVE:foo.lib"]);
+        let (_args, warnings) = parse_capturing_warnings(["-IMPLIB:foo.lib"]);
 
-        assert_eq!(warnings, ["-WHOLEARCHIVE:foo.lib is not yet supported"]);
+        assert_eq!(warnings, ["-IMPLIB:foo.lib is not yet supported"]);
     }
 
     #[test]

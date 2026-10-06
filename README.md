@@ -12,6 +12,7 @@ already pretty fast even without incremental linking.
 * [Usage](USAGE.md)
 * [Frequently asked questions](FAQ.md)
 * [Linker script support](LINKER_SCRIPT_SUPPORT.md)
+* [Windows x64 support and bootstrap](WINDOWS_SUPPORT.md)
 
 ## Benchmarks
 
@@ -37,13 +38,14 @@ The following platforms / architectures are currently supported:
 * RISC-V (riscv64gc) on Linux
 * LoongArch64 on Linux
 * PPC64LE on Linux (initial support)
+* x86-64 on Windows (initial COFF/PE executable support; see [Windows support](WINDOWS_SUPPORT.md))
 
 Here are some of the bigger things we're looking ahead to:
 
 * Incremental linking
 * Mach-O support
 * WebAssembly support
-* Windows support
+* Extended Windows support (DLLs, PDBs and broader MSVC compatibility)
 
 ## Installation
 

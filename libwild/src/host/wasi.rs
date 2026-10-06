@@ -72,6 +72,7 @@ pub(crate) mod os {
     pub(crate) const SANDBOXED: bool = true;
 
     pub(crate) const IS_MACOS: bool = false;
+    pub(crate) const IS_WINDOWS: bool = false;
 
     pub(crate) const CLANG_DRIVER_NOOP_SHORT_FLAGS: &[&str] = &[];
 }

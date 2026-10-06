@@ -4,6 +4,7 @@ pub(crate) mod arch;
 pub(crate) mod archive;
 pub mod args;
 pub(crate) mod compact_unwind;
+pub(crate) mod coff;
 pub(crate) mod compression;
 pub(crate) mod debug_trace;
 pub(crate) mod diagnostics;
@@ -254,7 +255,10 @@ impl<F: FileSystem> Linker<F> {
         }
 
         match args {
-            Args::Coff(_) => crate::bail!("PE/COFF (Windows) support is not yet implemented"),
+            Args::Coff(args) => {
+                coff::link(self.file_system.as_ref(), args)?;
+                Ok(LinkerOutput::empty())
+            }
             Args::Elf(elf_args) => crate::elf::link_for_arch(self, elf_args),
             Args::MachO(macho_args) => crate::macho::link_for_arch(self, macho_args),
             Args::Wasm(wasm_args) => crate::wasm::link_for_arch(self, wasm_args),

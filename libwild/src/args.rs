@@ -246,7 +246,9 @@ enum PlatformKind {
 
 impl PlatformKind {
     fn host() -> Self {
-        if crate::host::os::IS_MACOS {
+        if crate::host::os::IS_WINDOWS {
+            PlatformKind::Coff
+        } else if crate::host::os::IS_MACOS {
             PlatformKind::MachO
         } else {
             PlatformKind::Elf
@@ -808,7 +810,11 @@ impl<T: platform::Args> ArgumentParser<T> {
         // TODO @lapla-cogito standardize the interface. @file doesn't use a leading hyphen.
         // Handle `@file`option (recursively) - merging in the options contained in the file
         if let Some(path) = arg.strip_prefix('@') {
-            let file_args = read_args_from_file(Path::new(path))?;
+            let file_args = if self.syntax.case_insensitive {
+                coff::read_response_file(Path::new(path))?
+            } else {
+                read_args_from_file(Path::new(path))?
+            };
             let mut file_arg_iter = file_args.iter();
             while let Some(file_arg) = file_arg_iter.next() {
                 self.handle_argument(args, modifier_stack, file_arg, &mut file_arg_iter)?;

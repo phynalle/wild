@@ -20,6 +20,7 @@ pub(crate) mod os {
     pub(crate) use crate::host::unix::os::SANDBOXED;
 
     pub(crate) const IS_MACOS: bool = false;
+    pub(crate) const IS_WINDOWS: bool = false;
 
     /// On Illumos, the Clang driver inserts a meaningless -C flag before calling any non-GNU ld
     /// linker.

@@ -31,6 +31,7 @@ pub(crate) mod os {
     pub(crate) use crate::host::unix::os::SANDBOXED;
 
     pub(crate) const IS_MACOS: bool = true;
+    pub(crate) const IS_WINDOWS: bool = false;
 
     pub(crate) const CLANG_DRIVER_NOOP_SHORT_FLAGS: &[&str] = &[];
 }
