@@ -312,6 +312,14 @@ pub trait FileSystem: Send + Sync + 'static {
     /// Creates the sized random-access output.
     fn create_output(&self, path: Arc<Path>, options: OutputOptions) -> Result<Self::Output>;
 
+    /// Writes a complete main output. Implementations may avoid allocating a second buffer.
+    fn write_output(&self, path: Arc<Path>, options: OutputOptions, bytes: &[u8]) -> Result {
+        crate::ensure!(options.size == bytes.len() as u64, "Output size mismatch");
+        let mut output = self.create_output(path, options)?;
+        output.bytes_mut().copy_from_slice(bytes);
+        output.finish()
+    }
+
     /// Writes a complete auxiliary output.
     fn write_auxiliary(&self, path: &Path, bytes: &[u8]) -> Result;
 }
@@ -573,11 +581,123 @@ impl FileSystem for OsFileSystem {
         Ok(OsOutputFile { file, buffer, path })
     }
 
+    fn write_output(&self, path: Arc<Path>, options: OutputOptions, bytes: &[u8]) -> Result {
+        crate::ensure!(options.size == bytes.len() as u64, "Output size mismatch");
+        let mut file = {
+            let _span = tracing::info_span!("Output open/replace").entered();
+            open_complete_output(&path, options.file_replacement_mode)?
+        };
+        let defaults = OutputFileDefaults::for_file(&file);
+        let mode = options.write_mode.unwrap_or(defaults.write_mode);
+        let huge_pages = options
+            .madvise_huge_pages
+            .unwrap_or(defaults.madvise_huge_pages);
+        if options.madvise_huge_pages == Some(true)
+            && matches!(mode, FileWriteMode::BufferThenWrite)
+        {
+            bail!("--madvise-huge-pages requires mmapped output file");
+        }
+        if options.fallocate.unwrap_or(defaults.fallocate) {
+            if let Err(error) = crate::host::fs::preallocate(&file, options.size) {
+                if options.fallocate == Some(true) {
+                    return Err(error.into());
+                }
+            }
+        }
+        if matches!(mode, FileWriteMode::Mmap) && !bytes.is_empty() {
+            let mapped = {
+                let _span = tracing::info_span!("Output size/map").entered();
+                file.set_len(options.size)
+                    // SAFETY: The owned output file is sized before mapping, and the mapping
+                    // is used only to write this complete image before it is dropped.
+                    .and_then(|()| unsafe { MmapOptions::new().map_mut(&file) })
+            };
+            match mapped {
+                Ok(mut mapped) => {
+                    if let Err(error) = advise_huge_pages_if_requested(&mapped, huge_pages) {
+                        if options.madvise_huge_pages == Some(true) {
+                            return Err(error);
+                        }
+                    }
+                    {
+                        let _span = tracing::info_span!("Output mapped copy").entered();
+                        mapped.copy_from_slice(bytes);
+                    }
+                    let _span = tracing::info_span!("Output unmap/close").entered();
+                    drop(mapped);
+                    let _ = make_executable(&file);
+                    drop(file);
+                    return Ok(());
+                }
+                Err(error) if options.madvise_huge_pages == Some(true) => return Err(error.into()),
+                Err(_) => {}
+            }
+        }
+        {
+            let _span = tracing::info_span!("Output buffered write").entered();
+            file.write_all(bytes)
+                .with_context(|| format!("Failed to write {}", path.display()))?;
+            // Shrink in-place outputs, but allow devices that do not support set_len.
+            if file.metadata()?.is_file() {
+                file.set_len(options.size)?;
+            }
+        }
+        let _span = tracing::info_span!("Output close").entered();
+        let _ = make_executable(&file);
+        drop(file);
+        Ok(())
+    }
+
     fn write_auxiliary(&self, path: &Path, bytes: &[u8]) -> Result {
         let file = File::create(path)?;
         (&file).write_all(bytes)?;
         Ok(())
     }
+}
+
+fn open_complete_output(path: &Path, mode: FileReplacementMode) -> Result<File> {
+    let replace = || -> Result<File> {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("Failed to unlink {}", path.display()));
+            }
+        }
+        Ok(std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?)
+    };
+    if mode == FileReplacementMode::UnlinkAndReplace {
+        return replace();
+    }
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error)
+            if mode == FileReplacementMode::UpdateInPlaceWithFallback
+                && crate::host::fs::output_is_busy(&error) =>
+        {
+            return replace();
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to open {}", path.display()));
+        }
+    };
+    if mode == FileReplacementMode::UpdateInPlaceWithFallback
+        && crate::host::fs::may_have_multiple_links(&file.metadata()?)
+    {
+        drop(file);
+        return replace();
+    }
+    Ok(file)
 }
 
 fn unlink_and_recreate(path: &Path) -> Result<File> {

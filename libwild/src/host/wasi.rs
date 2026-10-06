@@ -28,6 +28,10 @@ pub(crate) mod fs {
         }
     }
 
+    pub(crate) fn output_is_busy(error: &std::io::Error) -> bool {
+        error.kind() == std::io::ErrorKind::ExecutableFileBusy
+    }
+
     pub(crate) fn may_have_multiple_links(_metadata: &std::fs::Metadata) -> bool {
         // std::os::wasi::fs::MetadataExt is unstable
         true

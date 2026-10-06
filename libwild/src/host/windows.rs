@@ -12,6 +12,11 @@ pub(crate) mod fs {
 
     pub(crate) type InputBytes = memmap2::Mmap;
 
+    pub(crate) fn output_is_busy(error: &std::io::Error) -> bool {
+        error.kind() == std::io::ErrorKind::ExecutableFileBusy
+            || matches!(error.raw_os_error(), Some(32 | 33))
+    }
+
     pub(crate) fn may_have_multiple_links(_metadata: &std::fs::Metadata) -> bool {
         // std::os::windows::fs::MetadataExt::number_of_links is unstable.
         true

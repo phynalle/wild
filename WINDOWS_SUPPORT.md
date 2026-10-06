@@ -43,6 +43,9 @@ linker = "D:/Workspace/wild/target/release/wild.exe"
   switches and Windows-style quoted UTF-8/UTF-16 response files.
 * Deterministic executable output. `/OPT:REF` and `/OPT:NOREF` control GC;
   `/OPT:ICF` is accepted but identical-code folding is not implemented.
+* `/TIME`, `/THREADS:n`, `/NO-THREADS`, `/MMAP-OUTPUT-FILE`,
+  `/NO-MMAP-OUTPUT-FILE`, `/UPDATE-IN-PLACE`, `/NO-UPDATE-IN-PLACE` and
+  `/UPDATE-IN-PLACE-WITH-FALLBACK` for profiling and output control.
 
 The new `libwild/src/coff/` backend owns COFF symbol resolution and PE layout,
 while sharing wild's argument infrastructure, filesystem/output abstractions,
@@ -61,8 +64,13 @@ silently substituted for an executable: `/DLL` fails explicitly.
 
 Support does not cover every possible MSVC library convention. Legacy long-form import objects mixed
 with synthesized short imports are not part of the verified compatibility set.
-The backend is currently correctness-first and serial; this work does not
-establish parity with the ELF linker's performance or feature coverage.
+COFF uses indexed lazy archive parsing, compact interned symbol names, input
+mapping ranges, associative-section adjacency lists and a symbol worklist.
+Large parsing batches, subsection sorts and disjoint output contributions use
+wild's existing Rayon pool and jobserver limits. Activation and diagnostics are
+merged deterministically. Small batches stay serial. PE contributions are
+copied and relocated directly in the final image; Windows complete-output
+writes avoid a second buffered image and honor file replacement semantics.
 
 ## Tests
 
@@ -72,7 +80,10 @@ cargo +stable test -p libwild --lib coff --no-default-features --locked
 
 COFF unit tests cover object layout, symbol conflicts, COMDAT selection, archive
 extraction, dead-section unresolved references, directives, response-file
-quoting/encoding/cycles, security headers and signed relocation addends. Windows
+quoting/encoding/cycles, security headers and signed relocation addends. They
+also cover indexed and incomplete archive indexes, nested associative COMDATs,
+late default libraries, hash collisions, output replacement and thread-count
+independent bytes and diagnostics. Windows
 CI builds the workspace and runs the focused tests.
 
 Some pre-existing all-library tests are not Windows-clean: ELF recursive

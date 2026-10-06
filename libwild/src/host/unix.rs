@@ -9,6 +9,10 @@ pub(crate) mod fs {
 
     pub(crate) type InputBytes = memmap2::Mmap;
 
+    pub(crate) fn output_is_busy(error: &std::io::Error) -> bool {
+        error.kind() == std::io::ErrorKind::ExecutableFileBusy
+    }
+
     pub(crate) fn may_have_multiple_links(metadata: &std::fs::Metadata) -> bool {
         use std::os::unix::fs::MetadataExt as _;
         metadata.nlink() > 1

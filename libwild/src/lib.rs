@@ -3,8 +3,8 @@ pub use args::Args;
 pub(crate) mod arch;
 pub(crate) mod archive;
 pub mod args;
-pub(crate) mod compact_unwind;
 pub(crate) mod coff;
+pub(crate) mod compact_unwind;
 pub(crate) mod compression;
 pub(crate) mod debug_trace;
 pub(crate) mod diagnostics;
@@ -519,5 +519,5 @@ pub fn init_timing() -> Result {
 }
 
 pub fn should_fork(args: &Args) -> bool {
-    args.common().should_fork()
+    cfg!(feature = "fork") && crate::host::process::CAN_FORK && args.common().should_fork()
 }

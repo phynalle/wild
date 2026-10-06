@@ -237,6 +237,58 @@ const IGNORED_NO_VALUE_FLAGS: &[&str] = &["nologo"];
 fn setup_argument_parser() -> ArgumentParser<CoffArgs> {
     let mut parser = ArgumentParser::<CoffArgs>::with_syntax(COFF_OPTION_SYNTAX);
 
+    parser.declare().long("time").execute(|args, _| {
+        args.common.time_phase_options = Some(Vec::new());
+        Ok(())
+    });
+    parser
+        .declare_with_optional_param()
+        .long("threads")
+        .execute(|args, _, value| {
+            args.common.num_threads = value
+                .map(str::parse::<std::num::NonZeroUsize>)
+                .transpose()?;
+            Ok(())
+        });
+    parser.declare().long("no-threads").execute(|args, _| {
+        args.common.num_threads = std::num::NonZeroUsize::new(1);
+        Ok(())
+    });
+    parser
+        .declare()
+        .long("mmap-output-file")
+        .execute(|args, _| {
+            args.common.file_write_mode = Some(crate::fs::FileWriteMode::Mmap);
+            Ok(())
+        });
+    parser
+        .declare()
+        .long("no-mmap-output-file")
+        .execute(|args, _| {
+            args.common.file_write_mode = Some(crate::fs::FileWriteMode::BufferThenWrite);
+            Ok(())
+        });
+    parser.declare().long("update-in-place").execute(|args, _| {
+        args.common.file_replacement_mode = Some(crate::fs::FileReplacementMode::UpdateInPlace);
+        Ok(())
+    });
+    parser
+        .declare()
+        .long("no-update-in-place")
+        .execute(|args, _| {
+            args.common.file_replacement_mode =
+                Some(crate::fs::FileReplacementMode::UnlinkAndReplace);
+            Ok(())
+        });
+    parser
+        .declare()
+        .long("update-in-place-with-fallback")
+        .execute(|args, _| {
+            args.common.file_replacement_mode =
+                Some(crate::fs::FileReplacementMode::UpdateInPlaceWithFallback);
+            Ok(())
+        });
+
     parser
         .declare_with_param()
         .long("out")

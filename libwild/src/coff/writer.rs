@@ -6,6 +6,7 @@ use crate::ensure;
 use crate::error::Context as _;
 use crate::error::Result;
 use crate::fs::FileSystem;
+use rayon::prelude::*;
 use std::collections::BTreeMap;
 
 struct OutputSection {
@@ -13,9 +14,11 @@ struct OutputSection {
     flags: u32,
     size: u32,
     data: Vec<u8>,
+    data_start: u32,
+    raw_len: u32,
     rva: u32,
     raw: u32,
-    members: Vec<(String, usize, usize)>,
+    members: Vec<(usize, usize)>,
 }
 
 fn align(v: u32, a: u32) -> u32 {
@@ -55,6 +58,7 @@ fn address<F: FileSystem>(
 ) -> Result<Address> {
     let base = r.args.image_base;
     match target {
+        Target::Archive(_) => bail!("Unresolved archive target"),
         Target::ImageBase => Ok(Address {
             va: base,
             section: 0,
@@ -88,7 +92,7 @@ fn address<F: FileSystem>(
             if symbol.section == 0 {
                 let (_, offset) = r
                     .commons
-                    .get(&symbol.name)
+                    .get(r.symbol_name(o, s))
                     .context("Unallocated common symbol")?;
                 return Ok(Address {
                     va: base + (outputs[common].rva + offset) as u64,
@@ -100,14 +104,14 @@ fn address<F: FileSystem>(
             ensure!(
                 symbol.section > 0,
                 "Invalid symbol section for {}",
-                symbol.name
+                r.symbol_name(o, s)
             );
             let (o, sec) = r.canonical(o, symbol.section as usize - 1);
             let sec = &r.objects[o].sections[sec];
             ensure!(
                 sec.live,
                 "Reference to discarded section {} in {}",
-                sec.name,
+                r.section_name(o, symbol.section as usize - 1),
                 r.objects[o].name
             );
             let relative = sec.offset + symbol.value;
@@ -121,51 +125,169 @@ fn address<F: FileSystem>(
     }
 }
 
+fn relocate_section<F: FileSystem>(
+    r: &Resolver<'_, F>,
+    outputs: &[OutputSection],
+    o: usize,
+    s: usize,
+    bytes: &mut [u8],
+    common: usize,
+) -> Result<Vec<(u32, u16)>> {
+    crate::verbose_timing_phase!("COFF contribution");
+    let object = &r.objects[o];
+    let sec = &object.sections[s];
+    let data = r.section_data(o, s);
+    ensure!(
+        data.len() <= bytes.len(),
+        "Section data exceeds output in {}",
+        object.name
+    );
+    bytes[..data.len()].copy_from_slice(data);
+    let mut base_relocations = Vec::new();
+    for i in 0..sec.relocs.len() / 10 {
+        let rel = r.reloc(o, s, i);
+        if rel.kind == 0 {
+            continue;
+        }
+        let target = address(r, outputs, r.target(o, rel.symbol)?, common)?;
+        let pos = rel.offset as usize;
+        let place = outputs[sec.output].rva + sec.offset + rel.offset;
+        let width = match rel.kind {
+            1 => 8,
+            10 => 2,
+            _ => 4,
+        };
+        ensure!(
+            pos + width <= sec.size as usize && pos + width <= bytes.len(),
+            "Relocation outside {} in {}",
+            r.section_name(o, s),
+            object.name
+        );
+        match rel.kind {
+            1 => {
+                put64(bytes, pos, u64_at(bytes, pos).wrapping_add(target.va));
+                if !target.absolute {
+                    base_relocations.push((place, 10));
+                }
+            }
+            2 => {
+                let value = i128::from(u32_at(bytes, pos) as i32) + i128::from(target.va);
+                put32(
+                    bytes,
+                    pos,
+                    u32::try_from(value).with_context(|| {
+                        format!(
+                            "ADDR32 overflow: {} section {} symbol {} value {value:#x}",
+                            object.name,
+                            r.section_name(o, s),
+                            r.symbol_name(o, rel.symbol)
+                        )
+                    })?,
+                );
+                if !target.absolute {
+                    base_relocations.push((place, 3));
+                }
+            }
+            3 => {
+                let addend = u32_at(bytes, pos);
+                let value = i128::from(target.va) - i128::from(r.args.image_base)
+                    + i128::from(addend as i32);
+                put32(bytes, pos, u32::try_from(value).with_context(|| format!("ADDR32NB overflow: {} section {} symbol {} target {:#x} addend {addend:#x}", object.name, r.section_name(o, s), r.symbol_name(o, rel.symbol), target.va))?);
+            }
+            4..=9 => {
+                let delta = i128::from(target.va) + i128::from(u32_at(bytes, pos) as i32)
+                    - i128::from(r.args.image_base + place as u64 + 4 + u64::from(rel.kind - 4));
+                put32(
+                    bytes,
+                    pos,
+                    i32::try_from(delta)
+                        .with_context(|| format!("REL32 overflow in {}", object.name))?
+                        .cast_unsigned(),
+                );
+            }
+            10 => {
+                put16(
+                    bytes,
+                    pos,
+                    u16::try_from(u16_at(bytes, pos) as usize + target.section + 1)?,
+                );
+            }
+            11 => {
+                put32(
+                    bytes,
+                    pos,
+                    u32::try_from(
+                        i64::from(u32_at(bytes, pos) as i32) + i64::from(target.relative),
+                    )
+                    .context("SECREL overflow")?,
+                );
+            }
+            kind => bail!(
+                "Unsupported x64 COFF relocation {kind:#x} in {}",
+                object.name
+            ),
+        }
+    }
+    Ok(base_relocations)
+}
+
 pub(super) fn write<F: FileSystem>(r: &mut Resolver<'_, F>) -> Result<Vec<u8>> {
+    let layout_time = crate::timing_guard!("COFF layout");
+    let parallel = rayon::current_num_threads() > 1
+        && !r.args.common.num_threads.is_some_and(|n| n.get() == 1);
     ensure!(
         r.args.image_base % 65536 == 0,
         "PE image base must be aligned to 64 KiB"
     );
-    let mut groups: BTreeMap<String, Vec<(String, usize, usize)>> = BTreeMap::new();
+    let mut groups: BTreeMap<&str, Vec<(usize, usize)>> = BTreeMap::new();
     for (o, object) in r.objects.iter().enumerate().filter(|(_, o)| o.active) {
-        for (s, sec) in object.sections.iter().enumerate().filter(|(_, s)| s.live) {
-            let mut name = sec.name.split('$').next().unwrap().to_owned();
+        for (s, _) in object.sections.iter().enumerate().filter(|(_, s)| s.live) {
+            let mut name = r.section_name(o, s).split('$').next().unwrap();
             let mut depth = 0;
-            while let Some(to) = r.merges.get(&name) {
-                name = to.clone();
+            while let Some(to) = r.merges.get(name) {
+                name = to;
                 depth += 1;
                 ensure!(depth < 32, "Section merge cycle");
             }
             ensure!(name.len() <= 8, "PE section name exceeds 8 bytes: {name}");
-            groups
-                .entry(name)
-                .or_default()
-                .push((sec.name.clone(), o, s));
+            groups.entry(name).or_default().push((o, s));
         }
     }
     if !r.commons.is_empty() {
-        groups.entry(".bss".into()).or_default();
+        groups.entry(".bss").or_default();
     }
     groups.retain(|name, members| {
-        (name == ".bss" && !r.commons.is_empty())
+        (*name == ".bss" && !r.commons.is_empty())
             || members
                 .iter()
-                .any(|(_, o, s)| r.objects[*o].sections[*s].size != 0)
+                .any(|(o, s)| r.objects[*o].sections[*s].size != 0)
     });
     if r.imports.iter().any(|i| i.live) {
-        groups.entry(".idata".into()).or_default();
-        groups.entry(".text".into()).or_default();
+        groups.entry(".idata").or_default();
+        groups.entry(".text").or_default();
     }
-    groups.entry(".reloc".into()).or_default();
+    groups.entry(".reloc").or_default();
     let mut outputs = Vec::new();
-    let mut groups: Vec<_> = groups.into_iter().collect();
+    let mut groups: Vec<_> = groups
+        .into_iter()
+        .map(|(name, members)| (name.to_owned(), members))
+        .collect();
     groups.sort_by_key(|(name, _)| name == ".reloc");
     for (name, mut members) in groups {
-        members.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        let compare = |a: &(usize, usize), b: &(usize, usize)| {
+            r.section_name_bytes(a.0, a.1)
+                .cmp(r.section_name_bytes(b.0, b.1))
+                .then(a.cmp(b))
+        };
+        if parallel && members.len() >= 4096 {
+            members.par_sort_unstable_by(compare);
+        } else {
+            members.sort_unstable_by(compare);
+        }
         let index = outputs.len();
         let mut size: u32 = 0;
         let mut flags = 0;
-        for (_, o, s) in &members {
+        for (o, s) in &members {
             let sec = &mut r.objects[*o].sections[*s];
             size = align(size, sec.align.max(1));
             sec.output = index;
@@ -203,11 +325,9 @@ pub(super) fn write<F: FileSystem>(r: &mut Resolver<'_, F>) -> Result<Vec<u8>> {
             name,
             flags,
             size,
-            data: if flags & 0x60 != 0 {
-                vec![0; size as usize]
-            } else {
-                Vec::new()
-            },
+            data: Vec::new(),
+            data_start: 0,
+            raw_len: if flags & 0x60 != 0 { size } else { 0 },
             rva: 0,
             raw: 0,
             members,
@@ -221,14 +341,10 @@ pub(super) fn write<F: FileSystem>(r: &mut Resolver<'_, F>) -> Result<Vec<u8>> {
         sec.size += *size;
     }
     for out in &mut outputs {
-        for (_, o, s) in &out.members {
+        for (o, s) in &out.members {
             let sec = &r.objects[*o].sections[*s];
             if !sec.data.is_empty() {
-                let end = sec.offset as usize + sec.data.len();
-                if out.data.len() < end {
-                    out.data.resize(end, 0);
-                }
-                out.data[sec.offset as usize..end].copy_from_slice(&sec.data);
+                out.raw_len = out.raw_len.max(sec.offset + sec.data.len() as u32);
             }
         }
     }
@@ -294,11 +410,12 @@ pub(super) fn write<F: FileSystem>(r: &mut Resolver<'_, F>) -> Result<Vec<u8>> {
         }
         sec.size = sec.data.len() as u32;
         let sec = &mut outputs[text.unwrap()];
+        sec.data_start = sec.size;
         for imp in r.imports.iter_mut().filter(|i| i.live && i.code) {
             sec.size = align(sec.size, 16);
             imp.thunk = sec.size;
             sec.size += 6;
-            sec.data.resize(sec.size as usize, 0xcc);
+            sec.data.resize((sec.size - sec.data_start) as usize, 0xcc);
         }
     }
     let headers = align(0x80 + 4 + 20 + 240 + outputs.len() as u32 * 40, 512);
@@ -327,7 +444,7 @@ pub(super) fn write<F: FileSystem>(r: &mut Resolver<'_, F>) -> Result<Vec<u8>> {
         for imp in r.imports.iter_mut().filter(|i| i.live) {
             imp.iat += idata_rva;
             if imp.code {
-                let offset = imp.thunk as usize;
+                let offset = (imp.thunk - sec.data_start) as usize;
                 imp.thunk += sec.rva;
                 sec.data[offset..offset + 2].copy_from_slice(&[0xff, 0x25]);
                 let delta = i64::from(imp.iat) - i64::from(imp.thunk + 6);
@@ -339,109 +456,111 @@ pub(super) fn write<F: FileSystem>(r: &mut Resolver<'_, F>) -> Result<Vec<u8>> {
             }
         }
     }
-    let mut base_relocations = Vec::new();
-    for (o, object) in r.objects.iter().enumerate().filter(|(_, o)| o.active) {
-        for sec in object.sections.iter().filter(|s| s.live) {
-            for rel in &sec.relocs {
-                if rel.kind == 0 {
-                    continue;
-                }
-                let target = address(r, &outputs, r.target(o, rel.symbol)?, common)?;
-                let pos = sec.offset as usize + rel.offset as usize;
-                let place = outputs[sec.output].rva + sec.offset + rel.offset;
-                let bytes = &mut outputs[sec.output].data;
-                let width = match rel.kind {
-                    1 => 8,
-                    10 => 2,
-                    _ => 4,
-                };
+    let mut raw = headers;
+    let mut relocation_count = 0;
+    let mut jobs = Vec::new();
+    for out in &mut outputs {
+        if !out.data.is_empty() {
+            out.raw_len = out.raw_len.max(out.data_start + out.data.len() as u32);
+        }
+        if out.raw_len != 0 {
+            out.raw = raw;
+            raw = raw
+                .checked_add(align(out.raw_len, 512))
+                .context("PE file exceeds 4 GiB")?;
+        }
+        for &(o, s) in &out.members {
+            let sec = &r.objects[o].sections[s];
+            relocation_count += sec.relocs.len() / 10;
+            if out.raw_len == 0 {
                 ensure!(
-                    pos + width <= sec.offset as usize + sec.size as usize
-                        && pos + width <= bytes.len(),
+                    (0..sec.relocs.len() / 10).all(|i| r.reloc(o, s, i).kind == 0),
                     "Relocation outside {} in {}",
-                    sec.name,
-                    object.name
+                    r.section_name(o, s),
+                    r.objects[o].name
                 );
-                match rel.kind {
-                    1 => {
-                        let value = u64_at(bytes, pos).wrapping_add(target.va);
-                        put64(bytes, pos, value);
-                        if !target.absolute {
-                            base_relocations.push((place, 10u16));
-                        }
-                    }
-                    2 => {
-                        let value = i128::from(u32_at(bytes, pos) as i32) + i128::from(target.va);
-                        put32(
-                            bytes,
-                            pos,
-                            u32::try_from(value).with_context(|| {
-                                format!(
-                                    "ADDR32 overflow: {} section {} symbol {} value {value:#x}",
-                                    object.name, sec.name, object.symbols[rel.symbol].name
-                                )
-                            })?,
-                        );
-                        if !target.absolute {
-                            base_relocations.push((place, 3u16));
-                        }
-                    }
-                    3 => {
-                        let addend = u32_at(bytes, pos);
-                        let value = i128::from(target.va) - i128::from(r.args.image_base)
-                            + i128::from(addend as i32);
-                        put32(bytes, pos, u32::try_from(value).with_context(|| format!("ADDR32NB overflow: {} section {} symbol {} target {:#x} addend {addend:#x}", object.name, sec.name, object.symbols[rel.symbol].name, target.va))?);
-                    }
-                    4..=9 => {
-                        let addend = u32_at(bytes, pos) as i32;
-                        let delta = i128::from(target.va) + i128::from(addend)
-                            - i128::from(
-                                r.args.image_base + place as u64 + 4 + u64::from(rel.kind - 4),
-                            );
-                        put32(
-                            bytes,
-                            pos,
-                            i32::try_from(delta)
-                                .with_context(|| format!("REL32 overflow in {}", object.name))?
-                                .cast_unsigned(),
-                        );
-                    }
-                    10 => {
-                        let value = u16_at(bytes, pos) as usize + target.section + 1;
-                        put16(bytes, pos, u16::try_from(value)?);
-                    }
-                    11 => {
-                        let value =
-                            i64::from(u32_at(bytes, pos) as i32) + i64::from(target.relative);
-                        put32(bytes, pos, u32::try_from(value).context("SECREL overflow")?);
-                    }
-                    kind => bail!(
-                        "Unsupported x64 COFF relocation {kind:#x} in {}",
-                        object.name
-                    ),
+            } else {
+                jobs.push((
+                    out.raw as usize + sec.offset as usize,
+                    o,
+                    s,
+                    sec.size.min(out.raw_len.saturating_sub(sec.offset)) as usize,
+                ));
+            }
+        }
+    }
+    let mut image = Vec::with_capacity(raw as usize + relocation_count * 12);
+    image.resize(raw as usize, 0);
+    for out in &outputs {
+        let start = (out.raw + out.data_start) as usize;
+        image[start..start + out.data.len()].copy_from_slice(&out.data);
+    }
+    drop(layout_time);
+    let relocation_time = crate::timing_guard!("COFF copy/relocate");
+    let mut tasks = Vec::with_capacity(jobs.len());
+    let mut remaining = image.as_mut_slice();
+    let mut cursor = 0;
+    for (start, o, s, len) in jobs {
+        let (_, tail) = remaining.split_at_mut(start - cursor);
+        let (bytes, tail) = tail.split_at_mut(len);
+        tasks.push((o, s, bytes));
+        remaining = tail;
+        cursor = start + len;
+    }
+    let work = |(o, s, bytes): &mut (usize, usize, &mut [u8])| {
+        (*o, *s, relocate_section(r, &outputs, *o, *s, bytes, common))
+    };
+    let results: Vec<_> = if parallel && raw >= 1024 * 1024 && tasks.len() >= 2 {
+        tasks.par_iter_mut().map(work).collect()
+    } else {
+        tasks.iter_mut().map(work).collect()
+    };
+    drop(tasks);
+    let mut base_relocations = Vec::new();
+    let mut first_error = None;
+    for (o, s, result) in results {
+        match result {
+            Ok(relocations) => base_relocations.extend(relocations),
+            Err(error) => {
+                if first_error.as_ref().is_none_or(|(key, _)| (o, s) < *key) {
+                    first_error = Some(((o, s), error));
                 }
             }
         }
     }
+    if let Some((_, error)) = first_error {
+        return Err(error);
+    }
+    drop(relocation_time);
+    let _finalize_time = crate::timing_guard!("COFF finalize PE");
     let mut exception_directory = (0, 0);
     if let Some(i) = outputs.iter().position(|s| s.name == ".pdata") {
         let out = &mut outputs[i];
-        ensure!(out.data.len() % 12 == 0, "Invalid x64 .pdata length");
-        let mut records: Vec<[u8; 12]> = out
-            .data
+        ensure!(out.raw_len % 12 == 0, "Invalid x64 .pdata length");
+        let mut records: Vec<[u8; 12]> = image
+            [out.raw as usize..out.raw as usize + out.raw_len as usize]
             .chunks_exact(12)
             .map(|b| b.try_into().unwrap())
             .filter(|b: &[u8; 12]| u32_at(b, 0) != 0)
             .collect();
         records.sort_by_key(|b| u32_at(b, 0));
-        out.data = records.into_iter().flatten().collect();
-        out.size = out.data.len() as u32;
+        out.size = records.len() as u32 * 12;
+        out.raw_len = out.size;
+        for (slot, record) in records.iter().enumerate() {
+            let start = out.raw as usize + slot * 12;
+            image[start..start + 12].copy_from_slice(record);
+        }
         exception_directory = (out.rva, out.size);
     }
     base_relocations.sort_unstable();
     base_relocations.dedup();
     let reloc_output = outputs.iter().position(|s| s.name == ".reloc").unwrap();
     let reloc = &mut outputs[reloc_output];
+    reloc.data = if reloc.raw_len == 0 {
+        Vec::new()
+    } else {
+        image[reloc.raw as usize..reloc.raw as usize + reloc.raw_len as usize].to_vec()
+    };
     let mut cursor = 0;
     while cursor < base_relocations.len() {
         let page = base_relocations[cursor].0 & !4095;
@@ -462,6 +581,13 @@ pub(super) fn write<F: FileSystem>(r: &mut Resolver<'_, F>) -> Result<Vec<u8>> {
         put32(&mut reloc.data, start + 4, size);
     }
     reloc.size = reloc.data.len() as u32;
+    if reloc.raw_len == 0 {
+        reloc.raw = image.len() as u32;
+    }
+    reloc.raw_len = reloc.size;
+    let reloc_start = reloc.raw as usize;
+    image.resize(reloc_start + align(reloc.raw_len, 512) as usize, 0);
+    image[reloc_start..reloc_start + reloc.data.len()].copy_from_slice(&reloc.data);
     let end = outputs
         .iter()
         .filter(|s| s.name != ".reloc")
@@ -489,7 +615,10 @@ pub(super) fn write<F: FileSystem>(r: &mut Resolver<'_, F>) -> Result<Vec<u8>> {
     let mut load_config = (0, 0);
     if let Some(t) = r.named_target("_load_config_used", 0)? {
         let a = address(r, &outputs, t, common)?;
-        let size = u32_at(&outputs[a.section].data, a.relative as usize);
+        let size = u32_at(
+            &image,
+            outputs[a.section].raw as usize + a.relative as usize,
+        );
         load_config = ((a.va - r.args.image_base) as u32, size);
     }
     if imports.is_empty() {
@@ -498,9 +627,9 @@ pub(super) fn write<F: FileSystem>(r: &mut Resolver<'_, F>) -> Result<Vec<u8>> {
             let descriptors: Vec<_> = sec
                 .members
                 .iter()
-                .filter(|(n, _, _)| n == ".idata$2")
+                .filter(|(o, s)| r.section_name(*o, *s) == ".idata$2")
                 .collect();
-            if let Some((_, o, s)) = descriptors.first() {
+            if let Some((o, s)) = descriptors.first() {
                 import_directory = (
                     sec.rva + r.objects[*o].sections[*s].offset,
                     (descriptors.len() as u32 + 1) * 20,
@@ -516,12 +645,18 @@ pub(super) fn write<F: FileSystem>(r: &mut Resolver<'_, F>) -> Result<Vec<u8>> {
     }
     let mut raw = headers;
     for out in &mut outputs {
-        if !out.data.is_empty() {
+        if out.raw_len != 0 {
+            image.copy_within(
+                out.raw as usize..out.raw as usize + out.raw_len as usize,
+                raw as usize,
+            );
             out.raw = raw;
-            raw += align(out.data.len() as u32, 512);
+            let end = raw + out.raw_len;
+            raw += align(out.raw_len, 512);
+            image[end as usize..raw as usize].fill(0);
         }
     }
-    let mut image = vec![0u8; raw as usize];
+    image.truncate(raw as usize);
     ensure!(
         outputs.len() <= 96,
         "Windows PE loader supports at most 96 sections"
@@ -552,7 +687,7 @@ pub(super) fn write<F: FileSystem>(r: &mut Resolver<'_, F>) -> Result<Vec<u8>> {
         outputs
             .iter()
             .filter(|s| s.flags & 0x20 != 0)
-            .map(|s| align(s.data.len() as u32, 512))
+            .map(|s| align(s.raw_len, 512))
             .sum(),
     );
     put32(
@@ -561,7 +696,7 @@ pub(super) fn write<F: FileSystem>(r: &mut Resolver<'_, F>) -> Result<Vec<u8>> {
         outputs
             .iter()
             .filter(|s| s.flags & 0x40 != 0)
-            .map(|s| align(s.data.len() as u32, 512))
+            .map(|s| align(s.raw_len, 512))
             .sum(),
     );
     put32(
@@ -627,12 +762,9 @@ pub(super) fn write<F: FileSystem>(r: &mut Resolver<'_, F>) -> Result<Vec<u8>> {
         image[sh..sh + out.name.len()].copy_from_slice(out.name.as_bytes());
         put32(&mut image, sh + 8, out.size);
         put32(&mut image, sh + 12, out.rva);
-        put32(&mut image, sh + 16, align(out.data.len() as u32, 512));
+        put32(&mut image, sh + 16, align(out.raw_len, 512));
         put32(&mut image, sh + 20, out.raw);
         put32(&mut image, sh + 36, out.flags);
-        if !out.data.is_empty() {
-            image[out.raw as usize..out.raw as usize + out.data.len()].copy_from_slice(&out.data);
-        }
     }
     Ok(image)
 }
