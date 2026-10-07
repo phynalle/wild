@@ -270,6 +270,11 @@ impl MultiErrorBuilder {
             Err(Error(Box::new(self.errors)))
         }
     }
+
+    pub(crate) fn emit_sorted_errors(mut self) -> Result {
+        self.errors.sort_by(|a, b| a.messages.cmp(&b.messages));
+        self.emit_errors_if_any()
+    }
 }
 
 #[cfg(test)]

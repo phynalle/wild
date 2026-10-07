@@ -418,6 +418,67 @@ pub(crate) trait Platform:
 
     /// Format-specific fields that form part of a section's identity.
     type SectionIdentityExt: std::fmt::Debug + Copy + Eq + Send + Sync + std::hash::Hash;
+    type InputResolutionState: Default;
+
+    fn entry_point<'a>(db: &'a SymbolDb<Self>, scripted_entry: Option<&'a [u8]>) -> EntryPoint<'a> {
+        db.args.entry_point(scripted_entry)
+    }
+
+    /// Runs after archive extraction, before canonical definitions are finalized.
+    fn resolve_input_extensions<'data, F: FileSystem>(
+        _state: &mut Self::InputResolutionState,
+        _symbol_db: &mut SymbolDb<'data, Self>,
+        _resolver: &mut Resolver<'data, Self>,
+        _file_loader: &mut FileLoader<'data, F>,
+        _flags: &mut PerSymbolFlags,
+        _sections: &mut OutputSections<'data, Self>,
+        _rules: &mut LayoutRulesBuilder<'data>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn select_input_sections<'data>(
+        _symbol_db: &mut SymbolDb<'data, Self>,
+        _resolved: &[resolution::ResolvedGroup<'data, Self>],
+    ) -> Result {
+        Ok(())
+    }
+
+    fn configure_input_layout<'data>(
+        _state: &Self::InputResolutionState,
+        _db: &SymbolDb<'data, Self>,
+        _resolved: &[resolution::ResolvedGroup<'data, Self>],
+        _sections: &mut OutputSections<'data, Self>,
+        _rules: &mut LayoutRulesBuilder<'data>,
+    ) -> Result {
+        Ok(())
+    }
+
+    fn definition_is_available<'data>(
+        _object: &Self::File<'data>,
+        _symbol: &Self::SymtabEntry,
+        _index: object::SymbolIndex,
+    ) -> bool {
+        true
+    }
+
+    fn resolve_input_symbol<'data, 'scope>(
+        _object: &crate::grouping::SequencedInputObject<'data, Self>,
+        _index: object::SymbolIndex,
+        _symbol: &Self::SymtabEntry,
+        _definition: &mut SymbolId,
+        _resources: &'scope resolution::ResolutionResources<'data, 'scope, Self>,
+        _scope: &Scope<'scope>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn finalise_input_definitions<'data>(
+        _db: &mut SymbolDb<'data, Self>,
+        _groups: &[resolution::ResolvedGroup<'data, Self>],
+    ) -> Result {
+        Ok(())
+    }
 
     /// An index into the local object's symbol versions.
     type SymbolVersionIndex: Send + Sync + Copy;
@@ -502,6 +563,14 @@ pub(crate) trait Platform:
     /// Returns whether the supplied file kind is permitted in archives.
     fn is_allowed_in_archive(_kind: crate::file_kind::FileKind) -> bool {
         false
+    }
+
+    /// Materialize format-specific synthetic input before assigning shared symbol IDs.
+    fn prepare_object<'data>(
+        _object: &mut Self::File<'data>,
+        _allocator: &bumpalo_herd::Member<'data>,
+    ) -> Result {
+        Ok(())
     }
 
     /// Returns attributes of the supplied section. This is type+flags and doesn't include other
@@ -1034,6 +1103,14 @@ pub(crate) trait Platform:
     /// Whether the symbol table's first entry (index 0) is a reserved null / sentinel entry that
     /// should be excluded from name resolution. `true` for ELF (`STN_UNDEF`).
     const HAS_NULL_SYMBOL_ENTRY: bool = false;
+
+    fn preferred_symbol_candidate(
+        _db: &SymbolDb<Self>,
+        first: SymbolId,
+        _alternatives: &[SymbolId],
+    ) -> SymbolId {
+        first
+    }
 
     /// Used when the linker needs to create a symtab entry from scratch rather than copying one
     /// from an input file.

@@ -76,9 +76,14 @@ use std::sync::atomic::Ordering;
 pub(crate) struct Resolver<'data, P: Platform> {
     undefined_symbols: Vec<UndefinedSymbol<'data>>,
     pub(crate) resolved_groups: Vec<ResolvedGroup<'data, P>>,
+    requested_files: std::collections::BTreeSet<FileId>,
 }
 
 impl<'data, P: Platform> Resolver<'data, P> {
+    pub(crate) fn request_file(&mut self, file: FileId) -> bool {
+        self.requested_files.insert(file)
+    }
+
     /// Resolves undefined symbols. In the process of resolving symbols, we decide which archive
     /// entries to load. Some symbols may not have definitions, in which case we'll note those for
     /// later processing. Can be called multiple times with additional groups having been added to
@@ -230,6 +235,36 @@ fn resolve_symbols_and_select_archive_entries<'data, P: Platform>(
     };
 
     rayon::in_place_scope(|scope| {
+        if let Some(name) = resources.symbol_db.entry_symbol_name() {
+            load_symbol_named(&resources, &mut SymbolId::undefined(), name, scope);
+        }
+        for file in &resolver.requested_files {
+            resources.try_request_file_id(*file, scope);
+        }
+        for name in &resources.symbol_db.extra_required_symbols {
+            load_symbol_named(&resources, &mut SymbolId::undefined(), name, scope);
+        }
+        for undefined in &resolver.undefined_symbols {
+            if undefined.ignore_if_loaded.is_some() {
+                continue;
+            }
+            if let crate::grouping::SequencedInput::Object(object) = resources
+                .symbol_db
+                .file(resources.symbol_db.file_id_for_symbol(undefined.symbol_id))
+            {
+                if object
+                    .parsed
+                    .object
+                    .symbol(undefined.symbol_id.to_input(object.symbol_id_range))
+                    .is_ok_and(|symbol| symbol.is_weak())
+                {
+                    continue;
+                }
+            }
+            if let Some(id) = resources.symbol_db.get(&undefined.name, false) {
+                resources.try_request_file_id(resources.symbol_db.file_id_for_symbol(id), scope);
+            }
+        }
         initial_work.into_par_iter().for_each(|work_item| {
             process_object(work_item, &resources, scope);
         });
@@ -242,9 +277,11 @@ fn resolve_symbols_and_select_archive_entries<'data, P: Platform>(
 
     symbol_db.restore_definitions(symbol_definitions);
 
-    if let Some(e) = outputs.errors.pop() {
-        return Err(e);
+    let mut errors = error::MultiErrorBuilder::new();
+    while let Some(e) = outputs.errors.pop() {
+        errors.add_error(e);
     }
+    errors.emit_sorted_errors()?;
 
     verbose_timing_phase!("Gather loaded objects");
 
@@ -1291,6 +1328,14 @@ fn canonicalise_undefined_symbols<'data, P: Platform>(
     undefined_symbols.sort_by_key(|u| usize::MAX - u.symbol_id.as_usize());
 
     for undefined in undefined_symbols {
+        if let Some(candidate) = symbol_db.get(&undefined.name, false) {
+            let addend = symbol_db.definition_addend(candidate);
+            let candidate = symbol_db.definition(candidate);
+            if symbol_db.symbol_strength(candidate, groups) != SymbolStrength::Undefined {
+                symbol_db.replace_definition_with_addend(undefined.symbol_id, candidate, addend);
+                continue;
+            }
+        }
         let is_defined = undefined.ignore_if_loaded.is_some_and(|file_id| {
             !matches!(
                 groups[file_id.group()].files[file_id.file()],
@@ -1692,6 +1737,7 @@ fn resolve_section<'data, P: Platform>(
         SectionRuleOutcome::Custom => {
             part_id = PartId::CUSTOM_PLACEHOLDER;
             unloaded_section = UnloadedSection::new();
+            unloaded_section.needs_sorting = args.sort_sections_by_name();
             unloaded_section.start_stop_eligible = !section_name.starts_with(b".");
         }
         SectionRuleOutcome::RiscVAttribute => {
@@ -1763,6 +1809,16 @@ fn resolve_symbols<'data, 'scope, P: Platform>(
         .zip(definitions_out)
         .try_for_each(
             |((local_symbol_index, local_symbol), definition)| -> Result {
+                if P::resolve_input_symbol(
+                    obj,
+                    object::SymbolIndex(start_symbol_offset + local_symbol_index),
+                    local_symbol,
+                    definition,
+                    resources,
+                    scope,
+                )? {
+                    return Ok(());
+                }
                 // Don't try to resolve symbols that are already defined, e.g. locals and globals
                 // that we define. Also skip the null symbol entry at index 0 for formats that
                 // have one. Hidden symbols exported from shared objects don't make sense, so we
@@ -2028,6 +2084,7 @@ impl<'data, P: Platform> Default for Resolver<'data, P> {
         Self {
             undefined_symbols: Default::default(),
             resolved_groups: Default::default(),
+            requested_files: Default::default(),
         }
     }
 }

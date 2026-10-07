@@ -66,21 +66,26 @@ impl<'data> Iterator for ArchiveIterator<'data> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.iter.next() {
-            Some(Ok(member)) => Some(Ok(if self.is_thin {
-                ArchiveEntry::Thin(ThinEntry {
+            Some(Ok(member)) => Some(if self.is_thin {
+                Ok(ArchiveEntry::Thin(ThinEntry {
                     ident: Identifier {
                         data: member.name(),
                     },
-                })
+                }))
             } else {
-                ArchiveEntry::Regular(ArchiveContent {
-                    ident: Identifier {
-                        data: member.name(),
-                    },
-                    entry_data: member.data(self.data).unwrap(),
-                    data_offset: member.file_range().0 as usize,
-                })
-            })),
+                member
+                    .data(self.data)
+                    .map(|entry_data| {
+                        ArchiveEntry::Regular(ArchiveContent {
+                            ident: Identifier {
+                                data: member.name(),
+                            },
+                            entry_data,
+                            data_offset: member.file_range().0 as usize,
+                        })
+                    })
+                    .map_err(Into::into)
+            }),
             Some(Err(e)) => Some(Err(e.into())),
             None => None,
         }
@@ -117,6 +122,23 @@ mod tests {
         entries: Vec<Vec<u8>>,
         identifiers: Vec<Vec<u8>>,
         symbols: Vec<Vec<u8>>,
+    }
+
+    #[test]
+    fn truncated_member_is_an_error() {
+        let mut builder = ar::Builder::new(Vec::new());
+        builder
+            .append(&ar::Header::new(b"bad.obj".to_vec(), 1), &b"x"[..])
+            .unwrap();
+        let mut bytes = builder.into_inner().unwrap();
+        bytes[56..66].copy_from_slice(b"9999999999");
+        assert!(
+            ArchiveIterator::from_archive_bytes(&bytes)
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_err()
+        );
     }
 
     fn ar_read_entries(path: &Path) -> Result<Summary> {

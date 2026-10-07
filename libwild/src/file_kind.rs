@@ -22,6 +22,9 @@ pub(crate) enum FileKind {
     FatMachOObject,
     MachOStubLibrary,
     WasmObject,
+    CoffObject,
+    CoffBigObject,
+    CoffImport,
     Archive,
     ThinArchive,
     Text,
@@ -77,6 +80,16 @@ impl FileKind {
             Ok(FileKind::FatMachOObject)
         } else if bytes.starts_with(b"--- !tapi-tbd") || bytes.starts_with(b"tbd-version:") {
             Ok(FileKind::MachOStubLibrary)
+        } else if matches!(bytes.get(..2), Some([0x64, 0x86]) | Some([0, 0])) {
+            match object::FileKind::parse(bytes) {
+                Ok(object::FileKind::Coff) => Ok(FileKind::CoffObject),
+                Ok(object::FileKind::CoffBig) => Ok(FileKind::CoffBigObject),
+                Ok(object::FileKind::CoffImport) => Ok(FileKind::CoffImport),
+                _ if bytes.len() >= 20 && bytes.get(2..4) != Some(&[0xff, 0xff]) => {
+                    Ok(FileKind::CoffObject)
+                }
+                _ => bail!("Invalid COFF input header"),
+            }
         } else if bytes.is_ascii() {
             Ok(FileKind::Text)
         } else if bytes.starts_with(b"BC") {
@@ -163,6 +176,9 @@ impl std::fmt::Display for FileKind {
             FileKind::MachOObject => "Mach-O object",
             FileKind::MachODylib => "Mach-O dylib",
             FileKind::WasmObject => "Wasm object",
+            FileKind::CoffObject => "COFF object",
+            FileKind::CoffBigObject => "COFF big object",
+            FileKind::CoffImport => "COFF import",
             FileKind::FatMachOObject => "Fat Mach-O object",
             FileKind::MachOStubLibrary => "Mach-O TBD library",
             FileKind::Archive => "archive",

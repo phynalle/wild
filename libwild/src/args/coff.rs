@@ -9,6 +9,9 @@ use crate::platform::Args as _;
 use std::path::Path;
 use std::sync::Arc;
 
+// Full-link benchmarks favor eight workers over the host's logical CPU count.
+const DEFAULT_THREAD_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::new(8).unwrap();
+
 /// The only machine type we currently support.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CoffMachine {
@@ -48,17 +51,26 @@ pub struct CoffArgs {
 
 impl CoffArgs {
     pub(crate) fn new() -> Result<Self> {
-        Ok(Self {
+        let mut args = Self {
             common: CommonArgs::from_env()?,
             ..Default::default()
-        })
+        };
+        args.common.default_thread_cap = DEFAULT_THREAD_CAP;
+        if let Some(paths) = std::env::var_os("LIB") {
+            args.lib_search_path
+                .extend(std::env::split_paths(&paths).map(|p| p.into_boxed_path()));
+        }
+        Ok(args)
     }
 }
 
 impl Default for CoffArgs {
     fn default() -> Self {
         Self {
-            common: CommonArgs::default(),
+            common: CommonArgs {
+                default_thread_cap: DEFAULT_THREAD_CAP,
+                ..CommonArgs::default()
+            },
             entry: None,
             subsystem: None,
             is_dll: false,
@@ -94,19 +106,25 @@ impl platform::Args for CoffArgs {
         true
     }
 
+    fn image_base(&self) -> Option<u64> {
+        Some(self.image_base)
+    }
+    fn should_gc_sections(&self) -> bool {
+        self.gc
+    }
+    fn sort_sections_by_name(&self) -> bool {
+        true
+    }
+
     fn should_strip_all(&self) -> bool {
         false
     }
 
-    fn entry_point<'a>(
-        &'a self,
-        _linker_script_entry: Option<&'a [u8]>,
-    ) -> platform::EntryPoint<'a> {
-        self.entry
-            .as_deref()
-            .map_or(platform::EntryPoint::None, |entry| {
-                platform::EntryPoint::Symbol(entry.as_bytes())
-            })
+    fn entry_point<'a>(&'a self, inferred_entry: Option<&'a [u8]>) -> platform::EntryPoint<'a> {
+        self.entry.as_deref().map_or(
+            platform::EntryPoint::Symbol(inferred_entry.unwrap_or(b"mainCRTStartup")),
+            |entry| platform::EntryPoint::Symbol(entry.as_bytes()),
+        )
     }
 
     fn lib_search_path(&self) -> &[Box<Path>] {
@@ -164,6 +182,11 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut CoffArgs, i
     }
 
     args.common.report_unrecognized()?;
+    for input in &mut args.common.inputs {
+        if input.search_first.is_none() {
+            input.search_first = Some(std::path::PathBuf::from("."));
+        }
+    }
 
     Ok(())
 }

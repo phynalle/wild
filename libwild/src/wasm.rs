@@ -6605,6 +6605,7 @@ fn remap_wasm_index(indices: &[u32], index: u32, kind: &str) -> Result<u32> {
 }
 
 impl platform::Platform for Wasm {
+    type InputResolutionState = ();
     const NUM_SINGLE_PART_SECTIONS: u32 = SinglePartSectionId::Count as u32;
     const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 0;
 

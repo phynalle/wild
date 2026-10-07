@@ -75,6 +75,8 @@ pub struct SymbolDb<'data, P: Platform> {
     pub(crate) args: &'data P::Args,
 
     pub(crate) groups: Vec<Group<'data, P>>,
+    pub(crate) extra_required_symbols: Vec<&'data [u8]>,
+    fallback_aliases: HashMap<&'data [u8], &'data [u8]>,
 
     buckets: Vec<SymbolBucket<'data>>,
 
@@ -85,6 +87,7 @@ pub struct SymbolDb<'data, P: Platform> {
     /// were selected as the definition and for all locals, this will point to itself. e.g. the
     /// value at index 5 will be the symbol ID 5.
     symbol_definitions: Vec<SymbolId>,
+    definition_addends: HashMap<SymbolId, u64>,
 
     /// The names of symbols that mark the start / stop of sections. These are indexed by the
     /// offset into the SyntheticSymbols' symbol IDs.
@@ -362,7 +365,10 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
             buckets,
             symbol_file_ids: Vec::new(),
             symbol_definitions: Vec::new(),
+            definition_addends: Default::default(),
             groups: Vec::new(),
+            extra_required_symbols: Vec::new(),
+            fallback_aliases: HashMap::new(),
             start_stop_symbol_names: Default::default(),
             version_script,
             export_list,
@@ -392,7 +398,22 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
     ) -> Result {
         timing_phase!("Load inputs into symbol DB");
 
-        let parsed_objects = loaded.objects.into_iter().try_collect()?;
+        let mut parsed_objects: Vec<Box<crate::parsing::ParsedInputObject<'data, P>>> =
+            loaded.objects.into_iter().try_collect()?;
+        {
+            timing_phase!("Prepare input objects");
+            let results: Vec<_> = parsed_objects
+                .par_iter_mut()
+                .with_min_len(64)
+                .map_init(
+                    || self.herd.get(),
+                    |allocator, parsed| P::prepare_object(&mut parsed.object, allocator),
+                )
+                .collect();
+            for result in results {
+                result?;
+            }
+        }
 
         let processed_linker_scripts = parsing::process_linker_scripts(
             &loaded.linker_scripts,
@@ -838,6 +859,51 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
         self.symbol_definitions[symbol_id.as_usize()] = new_definition;
     }
 
+    pub(crate) fn replace_definition_with_addend(
+        &mut self,
+        symbol_id: SymbolId,
+        target: SymbolId,
+        addend: u64,
+    ) {
+        self.replace_definition(symbol_id, target);
+        if addend != 0 {
+            self.definition_addends.insert(symbol_id, addend);
+        } else {
+            self.definition_addends.remove(&symbol_id);
+        }
+    }
+
+    pub(crate) fn definition_addend(&self, symbol_id: SymbolId) -> u64 {
+        if self.definition_addends.is_empty() {
+            return 0;
+        }
+        self.definition_addends
+            .get(&symbol_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn flatten_definitions(&mut self) -> Result {
+        for index in 0..self.symbol_definitions.len() {
+            let id = SymbolId::from_usize(index);
+            let mut target = id;
+            let mut addend = 0u64;
+            for depth in 0..64 {
+                crate::ensure!(depth < 63, "Symbol definition chain exceeds 63 entries");
+                addend = addend
+                    .checked_add(self.definition_addend(target))
+                    .context("Symbol definition addend overflow")?;
+                let next = self.symbol_definitions[target.as_usize()];
+                if next == target {
+                    break;
+                }
+                target = next;
+            }
+            self.replace_definition_with_addend(id, target, addend);
+        }
+        Ok(())
+    }
+
     pub(crate) fn file<'db>(&'db self, file_id: FileId) -> SequencedInput<'db, 'data, P> {
         match &self.groups[file_id.group()] {
             Group::Prelude(prelude) => SequencedInput::Prelude(prelude),
@@ -891,10 +957,64 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
         prehashed: &PreHashed<UnversionedSymbolName>,
     ) -> Option<SymbolId> {
         let num_buckets = self.buckets.len();
-        self.buckets[prehashed.hash() as usize % num_buckets]
-            .name_to_id
-            .get(prehashed)
-            .copied()
+        let bucket = &self.buckets[prehashed.hash() as usize % num_buckets];
+        if let Some(&first) = bucket.name_to_id.get(prehashed) {
+            return Some(
+                bucket
+                    .alternative_definitions
+                    .get(&first)
+                    .map_or(first, |alternatives| {
+                        P::preferred_symbol_candidate(self, first, alternatives)
+                    }),
+            );
+        }
+        self.fallback_aliases
+            .get(prehashed.bytes())
+            .and_then(|name| self.get_unversioned(&UnversionedSymbolName::prehashed(name)))
+    }
+
+    pub(crate) fn get_unversioned_matching(
+        &self,
+        name: &PreHashed<UnversionedSymbolName>,
+        mut predicate: impl FnMut(SymbolId) -> bool,
+    ) -> Option<SymbolId> {
+        let bucket = &self.buckets[name.hash() as usize % self.buckets.len()];
+        let first = *bucket.name_to_id.get(name)?;
+        std::iter::once(first)
+            .chain(
+                bucket
+                    .alternative_definitions
+                    .get(&first)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            )
+            .find(|&id| predicate(id))
+    }
+
+    pub(crate) fn set_inferred_entry(&mut self, name: &'data [u8]) {
+        self.entry = Some(name);
+    }
+
+    pub(crate) fn add_fallback_alias(&mut self, from: &str, to: &str) -> Result<bool> {
+        if let Some(old) = self.fallback_aliases.get(from.as_bytes()) {
+            crate::ensure!(*old == to.as_bytes(), "Conflicting aliases for {from}");
+            return Ok(false);
+        }
+        let mut current = to.as_bytes();
+        for _ in 0..64 {
+            crate::ensure!(current != from.as_bytes(), "COFF alias cycle at {from}");
+            let Some(next) = self.fallback_aliases.get(current) else {
+                let allocator = self.herd.get();
+                self.fallback_aliases.insert(
+                    allocator.alloc_slice_copy(from.as_bytes()),
+                    allocator.alloc_slice_copy(to.as_bytes()),
+                );
+                return Ok(true);
+            };
+            current = next;
+        }
+        bail!("COFF alias chain exceeds 64 entries")
     }
 
     #[inline(always)]
@@ -904,7 +1024,7 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
         match key {
             PreHashedSymbolName::Unversioned(key) => {
                 let bucket = &self.buckets[key.hash() as usize % num_buckets];
-                let symbol_id = bucket.name_to_id.get(key).copied()?;
+                let symbol_id = self.get_unversioned(key)?;
 
                 if !allow_dynamic && self.file(self.file_id_for_symbol(symbol_id)).is_dynamic() {
                     return bucket.get_non_dynamic(symbol_id, self);
@@ -939,7 +1059,16 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
     ) -> SymbolStrength {
         let file_id = self.file_id_for_symbol(symbol_id);
         match &resolved[file_id.group()].files[file_id.file()] {
-            ResolvedFile::Object(obj) => obj.common.symbol_strength(symbol_id),
+            ResolvedFile::Object(obj) => {
+                let index = obj.common.symbol_id_range.id_to_input(symbol_id);
+                if obj.common.object.symbol(index).is_ok_and(|symbol| {
+                    P::definition_is_available(obj.common.object, symbol, index)
+                }) {
+                    obj.common.symbol_strength(symbol_id)
+                } else {
+                    SymbolStrength::Undefined
+                }
+            }
             ResolvedFile::Dynamic(obj) => obj.common.symbol_strength(symbol_id),
             ResolvedFile::StubLibrary(stub) => stub.symbol_strength(symbol_id),
             #[cfg(feature = "plugins")]
@@ -992,7 +1121,7 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
     }
 
     pub(crate) fn entry_point(&self) -> crate::platform::EntryPoint<'_> {
-        self.args.entry_point(self.entry)
+        P::entry_point(self, self.entry)
     }
 
     pub(crate) fn entry_symbol_name(&self) -> Option<&[u8]> {

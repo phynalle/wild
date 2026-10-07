@@ -77,6 +77,7 @@ pub struct CommonArgs {
     /// The number of actually available threads (considering jobserver)
     pub(crate) available_threads: NonZeroUsize,
     pub num_threads: Option<NonZeroUsize>,
+    pub(crate) default_thread_cap: NonZeroUsize,
     pub(crate) files_per_group: Option<u32>,
 
     jobserver_client: Option<Client>,
@@ -321,6 +322,7 @@ pub(crate) enum RelocationModel {
 impl Default for CommonArgs {
     fn default() -> Self {
         Self {
+            default_thread_cap: DEFAULT_THREAD_CAP,
             output: Arc::from(Path::new("a.out")),
             relocation_model: RelocationModel::Fixed,
             available_threads: NonZeroUsize::new(1).unwrap(),
@@ -394,7 +396,7 @@ impl CommonArgs {
         self.available_threads = self.num_threads.unwrap_or_else(|| {
             if let Some(client) = &self.jobserver_client {
                 while let Ok(Some(acquired)) = client.try_acquire()
-                    && tokens.len() < DEFAULT_THREAD_CAP.get()
+                    && tokens.len() + 1 < self.default_thread_cap.get()
                 {
                     tokens.push(acquired);
                 }
@@ -404,7 +406,7 @@ impl CommonArgs {
             } else {
                 std::thread::available_parallelism()
                     .unwrap_or(NonZeroUsize::new(1).unwrap())
-                    .min(DEFAULT_THREAD_CAP)
+                    .min(self.default_thread_cap)
             }
         });
 

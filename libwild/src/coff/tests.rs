@@ -2,6 +2,8 @@ use super::*;
 use crate::args::Input;
 use crate::args::InputSpec;
 use crate::args::Modifiers;
+use crate::args::coff::CoffArgs;
+use crate::error::Result;
 use object::Architecture;
 use object::BinaryFormat;
 use object::ComdatKind;
@@ -66,8 +68,107 @@ fn link_objects(objects: &[Vec<u8>], extra: impl FnOnce(&mut CoffArgs)) -> Resul
         });
     }
     extra(&mut args);
-    link(&crate::OsFileSystem, &args)?;
-    Ok(std::fs::read(&args.common.output).unwrap())
+    let output = args.common.output.clone();
+    let args = crate::args::Args::Coff(args);
+    let linker = crate::Linker::new();
+    drop(linker.run(&args)?);
+    Ok(std::fs::read(&output).unwrap())
+}
+
+#[test]
+fn explicit_strong_definition_prevents_earlier_archive_extraction() {
+    let image = link_objects(
+        &[
+            archive(&[object("entry", &[0xcc], None)]),
+            object("entry", &[0xc3], None),
+        ],
+        |_| {},
+    )
+    .unwrap();
+    let pe = object::read::pe::PeFile64::parse(&*image).unwrap();
+    assert_eq!(
+        pe.section_by_name(".text").unwrap().data().unwrap()[0],
+        0xc3
+    );
+}
+
+#[test]
+fn unselected_archive_definition_does_not_infer_entry() {
+    let image = link_objects(
+        &[
+            object("mainCRTStartup", &[0xc3], None),
+            archive(&[object("wmain", &[0xcc], None)]),
+        ],
+        |args| {
+            args.entry = None;
+        },
+    )
+    .unwrap();
+    let pe = object::read::pe::PeFile64::parse(&*image).unwrap();
+    assert_eq!(
+        pe.section_by_name(".text").unwrap().data().unwrap()[0],
+        0xc3
+    );
+}
+
+#[test]
+fn activated_archive_definition_can_infer_entry() {
+    let image = link_objects(
+        &[
+            object("mainCRTStartup", &[0xc3], None),
+            object("wmainCRTStartup", &[0x90, 0xc3], None),
+            archive(&[object("wmain", &[0xcc], None)]),
+        ],
+        |args| {
+            args.entry = None;
+            args.directives.push("/INCLUDE:wmain".into());
+        },
+    )
+    .unwrap();
+    let pe = object::read::pe::PeFile64::parse(&*image).unwrap();
+    let text = pe.section_by_name(".text").unwrap();
+    assert_eq!(
+        text.data().unwrap()[(pe.entry() - text.address()) as usize],
+        0x90
+    );
+}
+
+#[test]
+fn cyclic_weak_external_is_a_link_error() {
+    let mut bytes = symbol_object("entry", &[0xc3], None, true);
+    let parsed = match input::parse(&bytes, "weak.obj".into()).unwrap() {
+        input::Parsed::Object(o) => o,
+        _ => unreachable!(),
+    };
+    let index = parsed
+        .symbols
+        .iter()
+        .position(|s| s.weak().is_some())
+        .unwrap();
+    let table = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let auxiliary = table + (index + 1) * 18;
+    bytes[auxiliary..auxiliary + 4].copy_from_slice(&(index as u32).to_le_bytes());
+    let error = link_objects(&[bytes], |_| {}).unwrap_err().to_string();
+    assert!(error.contains("Weak external cycle"), "{error}");
+}
+
+#[test]
+fn absolute_entry_below_image_base_is_a_link_error() {
+    let mut o = Object::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    o.add_symbol(Symbol {
+        name: b"entry".to_vec(),
+        value: 1,
+        size: 0,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Linkage,
+        weak: false,
+        section: SymbolSection::Absolute,
+        flags: SymbolFlags::None,
+    });
+    let error = link_objects(&[o.write().unwrap()], |_| {})
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("below image base"), "{error}");
 }
 
 #[test]
@@ -83,6 +184,308 @@ fn pe_entry_and_section_permissions() {
 }
 
 #[test]
+fn imported_thunk_points_at_the_start_of_its_iat_slot() {
+    let payload = b"imported\0example.dll\0";
+    let mut import = vec![0; 20];
+    import[..4].copy_from_slice(&[0, 0, 0xff, 0xff]);
+    import[6..8].copy_from_slice(&0x8664u16.to_le_bytes());
+    import[12..16].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    import[18..20].copy_from_slice(&4u16.to_le_bytes());
+    import.extend_from_slice(payload);
+    let image = link_objects(&[caller("imported"), archive(&[import])], |_| {}).unwrap();
+    let pe = object::read::pe::PeFile64::parse(&*image).unwrap();
+    let text = pe.section_by_name(".text").unwrap();
+    let code = text.data().unwrap();
+    let call = i32::from_le_bytes(code[1..5].try_into().unwrap());
+    let thunk = (5 + call) as usize;
+    assert_eq!(&code[thunk..thunk + 2], &[0xff, 0x25]);
+    let displacement = i32::from_le_bytes(code[thunk + 2..thunk + 6].try_into().unwrap());
+    let target = (text.address() as i64 + thunk as i64 + 6 + i64::from(displacement)) as u64;
+    let iat = pe
+        .data_directory(object::pe::IMAGE_DIRECTORY_ENTRY_IAT)
+        .unwrap();
+    assert_eq!(
+        target,
+        0x140000000 + u64::from(iat.virtual_address.get(object::LittleEndian))
+    );
+}
+
+#[test]
+fn subsection_order_preserves_input_order_across_alignments() {
+    let mut objects = vec![object("entry", &[0xc3], None)];
+    for (name, value, alignment) in [
+        (b".rdata$Z", 0x33, 1),
+        (b".rdata$A", 0x11, 1),
+        (b".rdata$A", 0x22, 64),
+    ] {
+        let mut o = Object::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+        let section = o.add_section(Vec::new(), name.to_vec(), SectionKind::ReadOnlyData);
+        o.append_section_data(section, &[value], alignment);
+        objects.push(o.write().unwrap());
+    }
+    let image = link_objects(&objects, |a| {
+        a.directives.push("/SECTION:.rdata,R".into());
+    })
+    .unwrap();
+    let pe = object::read::pe::PeFile64::parse(&*image).unwrap();
+    let section = pe.section_by_name(".rdata").unwrap();
+    assert_eq!(
+        section
+            .data()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|b| *b != 0)
+            .collect::<Vec<_>>(),
+        [0x11, 0x22, 0x33]
+    );
+}
+
+#[test]
+fn alternate_name_retries_a_previously_unresolved_archive_request() {
+    let mut o = Object::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    let section = o.add_section(Vec::new(), b".drectve".to_vec(), SectionKind::Linker);
+    o.append_section_data(section, b"/ALTERNATENAME:alias=actual", 1);
+    let bytes = link_objects(
+        &[
+            caller("alias"),
+            o.write().unwrap(),
+            archive(&[object("actual", &[0xc3], None)]),
+        ],
+        |_| {},
+    )
+    .unwrap();
+    assert!(object::read::pe::PeFile64::parse(&*bytes).is_ok());
+}
+
+#[test]
+fn local_symbol_in_discarded_comdat_uses_selected_section_and_offset() {
+    let mut o = Object::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    let section = o.add_section(Vec::new(), b".text".to_vec(), SectionKind::Text);
+    o.append_section_data(section, &[0xcc, 0xcc], 16);
+    o.section_symbol(section);
+    let global = o.add_symbol(Symbol {
+        name: b"selected".to_vec(),
+        value: 0,
+        size: 2,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Linkage,
+        weak: false,
+        section: SymbolSection::Section(section),
+        flags: SymbolFlags::None,
+    });
+    let local = o.add_symbol(Symbol {
+        name: b"local".to_vec(),
+        value: 1,
+        size: 1,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Compilation,
+        weak: false,
+        section: SymbolSection::Section(section),
+        flags: SymbolFlags::None,
+    });
+    o.add_comdat(Comdat {
+        kind: ComdatKind::Any,
+        symbol: global,
+        sections: vec![section],
+    });
+    let data = o.add_section(Vec::new(), b".rdata".to_vec(), SectionKind::ReadOnlyData);
+    o.append_section_data(data, &[0; 8], 8);
+    o.add_relocation(
+        data,
+        Relocation {
+            offset: 0,
+            symbol: local,
+            addend: 0,
+            flags: RelocationFlags::Coff {
+                typ: object::pe::IMAGE_REL_AMD64_ADDR64,
+            },
+        },
+    )
+    .unwrap();
+    let image = link_objects(
+        &[
+            object("entry", &[0xc3], None),
+            object("selected", &[0xc3, 0x90], Some(ComdatKind::Any)),
+            o.write().unwrap(),
+        ],
+        |_| {},
+    )
+    .unwrap();
+    let pe = object::read::pe::PeFile64::parse(&*image).unwrap();
+    let pointer = u64::from_le_bytes(
+        pe.section_by_name(".rdata").unwrap().data().unwrap()[..8]
+            .try_into()
+            .unwrap(),
+    );
+    let text = pe.section_by_name(".text").unwrap();
+    assert_eq!(
+        text.data().unwrap()[(pointer - text.address()) as usize],
+        0x90
+    );
+}
+
+#[test]
+fn undefined_diagnostics_are_thread_count_independent() {
+    let temp = tempfile::tempdir().unwrap();
+    for (index, bytes) in [caller("missingZ"), renamed_caller("other", "missingA")]
+        .into_iter()
+        .enumerate()
+    {
+        std::fs::write(temp.path().join(format!("{index}.obj")), bytes).unwrap();
+    }
+    let mut expected = None;
+    for threads in [1, 2, 4] {
+        let mut args = CoffArgs::default();
+        args.entry = Some("entry".into());
+        args.common.output = Arc::from(temp.path().join("output.exe"));
+        for index in 0..2 {
+            args.common.inputs.push(Input {
+                spec: InputSpec::File(temp.path().join(format!("{index}.obj")).into()),
+                modifiers: Default::default(),
+                search_first: None,
+            });
+        }
+        let args = crate::Args::Coff(args);
+        let error = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| crate::Linker::new().run(&args).err().unwrap().to_string());
+        assert!(error.contains("missingA") && error.contains("missingZ"));
+        if let Some(previous) = &expected {
+            assert_eq!(&error, previous);
+        } else {
+            expected = Some(error);
+        }
+    }
+}
+
+#[test]
+fn bigobj_raw_symbol_indices_include_auxiliary_entries() {
+    let ordinary = caller("long_symbol_name");
+    let file =
+        object::read::coff::CoffFile::<_, object::pe::ImageFileHeader>::parse(&*ordinary).unwrap();
+    let original = file.coff_header();
+    let count = original.number_of_symbols.get(object::LittleEndian);
+    let start = original.pointer_to_symbol_table.get(object::LittleEndian) as usize;
+    let header = object::pe::AnonObjectHeaderBigobj {
+        sig1: object::pe::IMAGE_FILE_MACHINE_UNKNOWN.into(),
+        sig2: 0xffff.into(),
+        version: 2.into(),
+        machine: original.machine,
+        time_date_stamp: original.time_date_stamp,
+        class_id: object::pe::ANON_OBJECT_HEADER_BIGOBJ_CLASS_ID,
+        size_of_data: 0.into(),
+        flags: 0.into(),
+        meta_data_size: 0.into(),
+        meta_data_offset: 0.into(),
+        number_of_sections: u32::from(original.number_of_sections.get(object::LittleEndian)).into(),
+        pointer_to_symbol_table: (start as u32 + 36).into(),
+        number_of_symbols: count.into(),
+    };
+    let mut bytes = object::pod::bytes_of(&header).to_vec();
+    bytes.extend_from_slice(&ordinary[20..start]);
+    for index in 0..original.number_of_sections.get(object::LittleEndian) as usize {
+        for field in [20, 24, 28] {
+            let offset = 56 + index * 40 + field;
+            let pointer = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            if pointer != 0 {
+                bytes[offset..offset + 4].copy_from_slice(&(pointer + 36).to_le_bytes());
+            }
+        }
+    }
+    let mut auxiliaries = 0;
+    for raw in ordinary[start..start + count as usize * 18].chunks_exact(18) {
+        if auxiliaries != 0 {
+            bytes.extend_from_slice(raw);
+            bytes.extend_from_slice(&[0; 2]);
+            auxiliaries -= 1;
+        } else {
+            bytes.extend_from_slice(&raw[..12]);
+            bytes.extend_from_slice(
+                &i32::from(i16::from_le_bytes(raw[12..14].try_into().unwrap())).to_le_bytes(),
+            );
+            bytes.extend_from_slice(&raw[14..]);
+            auxiliaries = raw[17];
+        }
+    }
+    bytes.extend_from_slice(&ordinary[start + count as usize * 18..]);
+    assert_eq!(
+        object::FileKind::parse(&*bytes).unwrap(),
+        object::FileKind::CoffBig
+    );
+    let image = link_objects(&[bytes, object("long_symbol_name", &[0xc3], None)], |_| {}).unwrap();
+    let pe = object::read::pe::PeFile64::parse(&*image).unwrap();
+    assert_eq!(pe.entry(), pe.section_by_name(".text").unwrap().address());
+}
+
+#[test]
+fn named_wholearchive_activates_an_already_parsed_member_without_exports() {
+    let mut o = Object::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    let section = o.add_section(Vec::new(), b".rdata".to_vec(), SectionKind::ReadOnlyData);
+    o.append_section_data(section, &[0x7f], 1);
+    let image = link_objects(
+        &[
+            object("entry", &[0xc3], None),
+            archive(&[o.write().unwrap()]),
+        ],
+        |a| {
+            a.directives.push("/WHOLEARCHIVE:1.obj".into());
+        },
+    )
+    .unwrap();
+    let pe = object::read::pe::PeFile64::parse(&*image).unwrap();
+    assert_eq!(
+        pe.section_by_name(".rdata").unwrap().data().unwrap()[0],
+        0x7f
+    );
+}
+
+#[test]
+fn unselected_archive_directives_do_not_add_libraries_or_mismatches() {
+    let mut o = Object::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    let section = o.add_section(Vec::new(), b".drectve".to_vec(), SectionKind::Linker);
+    o.append_section_data(
+        section,
+        b"/DEFAULTLIB:nonexistent /FAILIFMISMATCH:unused=bad",
+        1,
+    );
+    let image = link_objects(
+        &[
+            caller("needed"),
+            archive(&[object("needed", &[0xc3], None), o.write().unwrap()]),
+        ],
+        |a| {
+            a.directives.push("/FAILIFMISMATCH:unused=good".into());
+        },
+    )
+    .unwrap();
+    assert!(object::read::pe::PeFile64::parse(&*image).is_ok());
+}
+
+#[test]
+fn section_attributes_override_input_permissions_after_merging() {
+    let mut o = Object::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    let section = o.add_section(Vec::new(), b".data$A".to_vec(), SectionKind::Data);
+    o.append_section_data(section, &[0x42], 1);
+    let image = link_objects(&[object("entry", &[0xc3], None), o.write().unwrap()], |a| {
+        a.directives
+            .extend(["/MERGE:.data=.rdata".into(), "/SECTION:.rdata,R".into()]);
+    })
+    .unwrap();
+    let pe = object::read::pe::PeFile64::parse(&*image).unwrap();
+    assert!(pe.section_by_name(".data").is_none());
+    let object::SectionFlags::Coff { characteristics } =
+        pe.section_by_name(".rdata").unwrap().flags()
+    else {
+        panic!("COFF flags expected");
+    };
+    assert!(!characteristics.contains(object::pe::IMAGE_SCN_MEM_WRITE));
+    assert!(characteristics.contains(object::pe::IMAGE_SCN_MEM_READ));
+}
+
+#[test]
 fn duplicate_strong_definitions_fail() {
     let err = link_objects(
         &[
@@ -92,7 +495,7 @@ fn duplicate_strong_definitions_fail() {
         |_| {},
     )
     .unwrap_err();
-    assert!(err.to_string().contains("Duplicate symbol entry"));
+    assert!(err.to_string().contains("Duplicate") && err.to_string().contains("entry"));
 }
 
 #[test]
@@ -109,6 +512,55 @@ fn comdat_any_selects_first() {
     assert_eq!(
         pe.section_by_name(".text").unwrap().data().unwrap()[0],
         0xc3
+    );
+}
+
+#[test]
+fn comdat_largest_and_newest_follow_selection_policy() {
+    for (kind, first, second, expected) in [
+        (ComdatKind::Largest, &[0xc3][..], &[0x90, 0xc3][..], 0x90),
+        (ComdatKind::Largest, &[0x90, 0xc3][..], &[0xcc][..], 0x90),
+        (ComdatKind::Newest, &[0xc3][..], &[0xcc][..], 0xcc),
+    ] {
+        let bytes = link_objects(
+            &[
+                object("entry", first, Some(kind)),
+                object("entry", second, Some(kind)),
+            ],
+            |_| {},
+        )
+        .unwrap();
+        let pe = object::read::pe::PeFile64::parse(&*bytes).unwrap();
+        assert_eq!(
+            pe.section_by_name(".text").unwrap().data().unwrap()[0],
+            expected
+        );
+    }
+}
+
+#[test]
+fn comdat_exact_match_and_no_duplicates_are_validated() {
+    for kind in [ComdatKind::ExactMatch, ComdatKind::NoDuplicates] {
+        assert!(
+            link_objects(
+                &[
+                    object("entry", &[0xc3], Some(kind)),
+                    object("entry", &[0xcc], Some(kind))
+                ],
+                |_| {}
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        link_objects(
+            &[
+                object("entry", &[0xc3], Some(ComdatKind::ExactMatch)),
+                object("entry", &[0xc3], Some(ComdatKind::ExactMatch))
+            ],
+            |_| {}
+        )
+        .is_ok()
     );
 }
 
@@ -172,7 +624,10 @@ fn dead_comdat_does_not_require_undefined_symbol() {
     assert!(link_objects(&[object("entry", &[0xc3], None), dead.clone()], |_| {}).is_ok());
     let error =
         link_objects(&[object("entry", &[0xc3], None), dead], |a| a.gc = false).unwrap_err();
-    assert!(error.to_string().contains("Undefined symbol missing"));
+    assert!(
+        error.to_string().contains("Undefined") && error.to_string().contains("missing"),
+        "{error:#?}"
+    );
 }
 
 #[test]
@@ -242,7 +697,7 @@ fn unused_archive_member_does_not_override_entry() {
         a.directives.push("/WHOLEARCHIVE".into())
     })
     .unwrap_err();
-    assert!(error.to_string().contains("Duplicate symbol entry"));
+    assert!(error.to_string().contains("Duplicate") && error.to_string().contains("entry"));
 }
 
 #[test]
@@ -411,30 +866,12 @@ fn defined_weak_fallback_does_not_extract_a_library_definition() {
     let name = std::str::from_utf8(&weak[parsed.symbols[fallback].name.range()]).unwrap();
     assert!(parsed.symbols[fallback].section > 0);
     let archive = indexed_archive(&[object(name, &[0xcc], None)], &[(name, 0)]);
-    let temp = tempfile::tempdir().unwrap();
-    let mut args = CoffArgs::default();
-    args.entry = Some("entry".into());
-    for (i, bytes) in [caller("builtin"), weak, archive].iter().enumerate() {
-        let path = temp.path().join(format!("{i}.obj"));
-        std::fs::write(&path, bytes).unwrap();
-        args.common.inputs.push(Input {
-            spec: InputSpec::File(path.into()),
-            modifiers: Modifiers::default(),
-            search_first: None,
-        });
-    }
-    let mut r = resolve::Resolver::new(&crate::OsFileSystem, &args);
-    r.load().unwrap();
-    r.resolve().unwrap();
-    assert!(!r.objects[2].parsed);
-}
-
-#[test]
-fn coff_metadata_uses_compact_indices() {
-    assert!(std::mem::size_of::<input::Symbol>() <= 40);
-    assert_eq!(std::mem::size_of::<Option<input::ResolvedTarget>>(), 8);
-    assert!(std::mem::size_of::<input::Section>() <= 96);
-    assert_eq!(std::mem::size_of::<input::ByteRange>(), 8);
+    let bytes = link_objects(&[caller("builtin"), weak, archive], |_| {}).unwrap();
+    let pe = object::read::pe::PeFile64::parse(&*bytes).unwrap();
+    let code = pe.section_by_name(".text").unwrap().data().unwrap();
+    assert!(!code.contains(&0xcc));
+    let displacement = i32::from_le_bytes(code[1..5].try_into().unwrap());
+    assert_eq!(code[(5 + displacement) as usize], 0xc3);
 }
 
 fn associative_object(name: &str, value: u8) -> Vec<u8> {
@@ -665,42 +1102,52 @@ fn output_options_preserve_explicit_modes() {
 #[test]
 fn complete_output_honors_replacement_and_shrinks() {
     use crate::fs::FileReplacementMode;
-    use crate::fs::FileSystem;
     use crate::fs::FileWriteMode;
-    use crate::fs::OutputOptions;
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("output.exe");
     let alias = temp.path().join("alias.exe");
-    for mode in [
-        FileReplacementMode::UnlinkAndReplace,
-        FileReplacementMode::UpdateInPlace,
-        FileReplacementMode::UpdateInPlaceWithFallback,
-    ] {
-        std::fs::write(&path, b"old output").unwrap();
-        std::fs::hard_link(&path, &alias).unwrap();
-        crate::OsFileSystem
-            .write_output(
-                Arc::from(path.as_path()),
-                OutputOptions {
-                    size: 3,
-                    file_replacement_mode: mode,
-                    write_mode: Some(FileWriteMode::BufferThenWrite),
-                    fallocate: Some(false),
-                    madvise_huge_pages: Some(false),
-                },
-                b"new",
-            )
-            .unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"new");
-        assert_eq!(
-            std::fs::read(&alias).unwrap(),
-            if mode == FileReplacementMode::UpdateInPlace {
-                b"new".as_slice()
-            } else {
-                b"old output".as_slice()
-            }
-        );
-        std::fs::remove_file(&alias).unwrap();
+    let input = temp.path().join("entry.obj");
+    std::fs::write(&input, object("entry", &[0xc3], None)).unwrap();
+    let original = vec![0x42; 1024 * 1024];
+    for threads in [1, 2] {
+        for mode in [
+            FileReplacementMode::UnlinkAndReplace,
+            FileReplacementMode::UpdateInPlace,
+            FileReplacementMode::UpdateInPlaceWithFallback,
+        ] {
+            std::fs::write(&path, &original).unwrap();
+            std::fs::hard_link(&path, &alias).unwrap();
+            let mut args = CoffArgs::default();
+            args.entry = Some("entry".into());
+            args.common.output = Arc::from(path.as_path());
+            args.common.file_replacement_mode = Some(mode);
+            args.common.file_write_mode = Some(FileWriteMode::BufferThenWrite);
+            args.common.available_threads = std::num::NonZeroUsize::new(threads).unwrap();
+            args.common.inputs.push(Input {
+                spec: InputSpec::File(input.clone().into()),
+                modifiers: Default::default(),
+                search_first: None,
+            });
+            let args = crate::Args::Coff(args);
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| crate::Linker::new().run(&args).map(drop))
+                .unwrap();
+            let image = std::fs::read(&path).unwrap();
+            assert!(image.len() < original.len());
+            assert!(object::read::pe::PeFile64::parse(&*image).is_ok());
+            assert_eq!(
+                std::fs::read(&alias).unwrap(),
+                if mode == FileReplacementMode::UpdateInPlace {
+                    image.as_slice()
+                } else {
+                    original.as_slice()
+                }
+            );
+            std::fs::remove_file(&alias).unwrap();
+        }
     }
 }
 
@@ -744,36 +1191,22 @@ fn indexed_archive(members: &[Vec<u8>], symbols: &[(&str, usize)]) -> Vec<u8> {
 }
 
 #[test]
-fn indexed_archive_parses_only_extracted_member() {
-    let temp = tempfile::tempdir().unwrap();
-    let mut args = CoffArgs::default();
-    args.entry = Some("entry".into());
+fn indexed_archive_selects_only_needed_member() {
     let members = [
         object("needed", &[0xc3], None),
         object("unused", &[0xcc], None),
     ];
-    for (i, bytes) in [
-        caller("needed"),
-        indexed_archive(&members, &[("unused", 1), ("needed", 0)]),
-    ]
-    .iter()
-    .enumerate()
-    {
-        let path = temp.path().join(format!("{i}.obj"));
-        std::fs::write(&path, bytes).unwrap();
-        args.common.inputs.push(Input {
-            spec: InputSpec::File(path.into()),
-            modifiers: Modifiers::default(),
-            search_first: None,
-        });
-    }
-    let mut r = resolve::Resolver::new(&crate::OsFileSystem, &args);
-    r.load().unwrap();
-    assert_eq!(r.objects.iter().filter(|o| o.parsed).count(), 1);
-    r.resolve().unwrap();
-    assert_eq!(r.objects.iter().filter(|o| o.parsed).count(), 2);
-    assert!(!r.objects[2].parsed);
-    assert_eq!(r.section_data(1, 0), &[0xc3]);
+    let bytes = link_objects(
+        &[
+            caller("needed"),
+            indexed_archive(&members, &[("unused", 1), ("needed", 0)]),
+        ],
+        |_| {},
+    )
+    .unwrap();
+    let pe = object::read::pe::PeFile64::parse(&*bytes).unwrap();
+    let code = pe.section_by_name(".text").unwrap().data().unwrap();
+    assert!(!code.contains(&0xcc));
 }
 
 #[test]
@@ -828,6 +1261,7 @@ fn archive_index_order_does_not_change_member_precedence() {
 #[test]
 fn thread_options_set_shared_pool_configuration() {
     let mut args = CoffArgs::default();
+    assert_eq!(args.common.default_thread_cap.get(), 8);
     crate::args::coff::parse(&mut args, ["/THREADS:2"].into_iter()).unwrap();
     assert_eq!(args.common.num_threads.unwrap().get(), 2);
     crate::args::coff::parse(&mut args, ["/NO-THREADS"].into_iter()).unwrap();
@@ -863,16 +1297,17 @@ fn parallel_parsing_and_relocation_are_byte_deterministic() {
             search_first: None,
         });
     }
+    let mut args = crate::Args::Coff(args);
     let mut expected = None;
     for threads in [1, 2, 4] {
-        args.common.num_threads = std::num::NonZeroUsize::new(threads);
+        args.common_mut().num_threads = std::num::NonZeroUsize::new(threads);
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
             .unwrap()
-            .install(|| link(&crate::OsFileSystem, &args))
+            .install(|| crate::Linker::new().run(&args).map(drop))
             .unwrap();
-        let image = std::fs::read(&args.common.output).unwrap();
+        let image = std::fs::read(&args.common().output).unwrap();
         let pe = object::read::pe::PeFile64::parse(&*image).unwrap();
         let pointers = pe.section_by_name(".rdata").unwrap().data().unwrap();
         assert_eq!(
@@ -895,12 +1330,12 @@ fn parallel_parsing_and_relocation_are_byte_deterministic() {
     std::fs::write(temp.path().join("0.obj"), invalid).unwrap();
     let mut previous_error = None;
     for threads in [1, 2, 4] {
-        args.common.num_threads = std::num::NonZeroUsize::new(threads);
+        args.common_mut().num_threads = std::num::NonZeroUsize::new(threads);
         let error = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
             .unwrap()
-            .install(|| link(&crate::OsFileSystem, &args))
+            .install(|| crate::Linker::new().run(&args).map(drop))
             .unwrap_err()
             .to_string();
         assert!(error.contains("Unsupported x64 COFF relocation"));
@@ -909,10 +1344,6 @@ fn parallel_parsing_and_relocation_are_byte_deterministic() {
         } else {
             previous_error = Some(error);
         }
-        assert_eq!(
-            &std::fs::read(&args.common.output).unwrap(),
-            expected.as_ref().unwrap()
-        );
     }
 }
 

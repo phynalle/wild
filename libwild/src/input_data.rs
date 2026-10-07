@@ -113,6 +113,14 @@ pub(crate) struct InputFileRef<'data> {
 }
 
 impl InputFileRef<'_> {
+    pub(crate) fn synthetic(filename: &Path) -> InputFileRef<'_> {
+        InputFileRef {
+            filename,
+            original_filename: filename,
+            modifiers: Modifiers::default(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn for_testing() -> Self {
         Self {
@@ -283,6 +291,9 @@ impl<'data> AuxiliaryFiles<'data> {
 }
 
 impl<'data, F: FileSystem> FileLoader<'data, F> {
+    pub(crate) fn file_system(&self) -> &F {
+        self.file_system.as_ref()
+    }
     pub(crate) fn new(
         inputs_arena: &'data Arena<InputFile<F::Input>>,
         file_system: Arc<F>,
@@ -559,6 +570,8 @@ fn process_archive<'data, P: Platform, F: FileSystem>(
             };
             state.process_input(member_ref, file, kind)
         })
+        .collect::<Vec<_>>()
+        .into_iter()
         .collect::<Result<Vec<_>>>()?;
 
     Ok(LoadedFileState::Archive(opened, outputs))
@@ -618,6 +631,8 @@ fn process_thin_archive<'data, P: Platform, F: FileSystem>(
             let parsed = state.process_input(input_ref, file.as_ref(), kind)?;
             Ok::<_, Error>((member_file, parsed))
         })
+        .collect::<Vec<_>>()
+        .into_iter()
         .collect::<Result<Vec<_>>>()?;
 
     let mut files = Vec::with_capacity(results.len());

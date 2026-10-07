@@ -63,6 +63,49 @@ pub(crate) mod symbol_db;
 pub(crate) mod thunks;
 #[cfg(test)]
 mod tidy_tests;
+#[cfg(test)]
+mod common_pipeline_tests {
+    use object::{Object as _, ObjectSection as _};
+
+    #[test]
+    fn elf_output_uses_shared_layout_on_the_current_host() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("entry.o");
+        let output = temp.path().join("image.elf");
+        let mut object = object::write::Object::new(
+            object::BinaryFormat::Elf,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let section = object.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+        object.append_section_data(section, &[0xc3], 16);
+        object.add_symbol(object::write::Symbol {
+            name: b"_start".to_vec(),
+            value: 0,
+            size: 1,
+            kind: object::SymbolKind::Text,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: object::write::SymbolSection::Section(section),
+            flags: object::SymbolFlags::None,
+        });
+        std::fs::write(&input, object.write().unwrap()).unwrap();
+        let mut args = crate::args::elf::ElfArgs::default();
+        args.common.output = std::sync::Arc::from(output.as_path());
+        args.common.inputs.push(crate::args::Input {
+            spec: crate::args::InputSpec::File(input.into()),
+            modifiers: Default::default(),
+            search_first: None,
+        });
+        let args = crate::Args::Elf(args);
+        drop(crate::Linker::new().run(&args).unwrap());
+        let bytes = std::fs::read(output).unwrap();
+        let file = object::File::parse(&*bytes).unwrap();
+        let text = file.section_by_name(".text").unwrap();
+        assert_eq!(file.entry(), text.address());
+        assert_eq!(text.data().unwrap()[0], 0xc3);
+    }
+}
 pub(crate) mod timing;
 pub(crate) use timing::timing_guard;
 pub(crate) use timing::timing_phase;
@@ -256,8 +299,8 @@ impl<F: FileSystem> Linker<F> {
 
         match args {
             Args::Coff(args) => {
-                coff::link(self.file_system.as_ref(), args)?;
-                Ok(LinkerOutput::empty())
+                crate::ensure!(!args.is_dll, "COFF DLL output is not supported yet");
+                self.link_for_arch::<coff::backend::Coff, coff::backend::CoffX64>(args)
             }
             Args::Elf(elf_args) => crate::elf::link_for_arch(self, elf_args),
             Args::MachO(macho_args) => crate::macho::link_for_arch(self, macho_args),
@@ -360,8 +403,40 @@ impl<F: FileSystem> Linker<F> {
 
         let mut resolver = resolution::Resolver::default();
 
-        resolver
-            .resolve_symbols_and_select_archive_entries(&mut symbol_db, &mut per_symbol_flags)?;
+        let mut input_resolution_state = P::InputResolutionState::default();
+        loop {
+            resolver.resolve_symbols_and_select_archive_entries(
+                &mut symbol_db,
+                &mut per_symbol_flags,
+            )?;
+            let expand_inputs = timing_guard!("Expand selected inputs");
+            let changed = P::resolve_input_extensions(
+                &mut input_resolution_state,
+                &mut symbol_db,
+                &mut resolver,
+                file_loader,
+                &mut per_symbol_flags,
+                &mut output_sections,
+                &mut layout_rules_builder,
+            )?;
+            drop(expand_inputs);
+            if !changed {
+                break;
+            }
+        }
+        {
+            timing_phase!("Select input sections");
+            P::select_input_sections(&mut symbol_db, &resolver.resolved_groups)?;
+        }
+        let configure_layout = timing_guard!("Configure input layout");
+        P::configure_input_layout(
+            &input_resolution_state,
+            &symbol_db,
+            &resolver.resolved_groups,
+            &mut output_sections,
+            &mut layout_rules_builder,
+        )?;
+        drop(configure_layout);
 
         // Now that we know which archive entries are being loaded, we can resolve alternative
         // symbol definitions.
@@ -370,6 +445,10 @@ impl<F: FileSystem> Linker<F> {
             &mut per_symbol_flags,
             &resolver.resolved_groups,
         )?;
+        {
+            timing_phase!("Finalise symbol definitions");
+            P::finalise_input_definitions(&mut symbol_db, &resolver.resolved_groups)?;
+        }
 
         if let Some(plugin) = plugin.as_mut()
             && plugin.is_initialised()

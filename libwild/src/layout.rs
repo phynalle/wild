@@ -94,6 +94,7 @@ use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::IntoParallelRefMutIterator;
 use rayon::iter::ParallelIterator;
+use rayon::slice::ParallelSliceMut;
 use smallvec::SmallVec;
 use std::cell::OnceCell;
 use std::collections::BTreeMap;
@@ -1841,9 +1842,12 @@ impl<'data, P: Platform> Layout<'data, P> {
     ) -> Option<Resolution<P>> {
         self.local_symbol_resolution(self.symbol_db.definition(symbol_id))
             .copied()
-            .map(|mut res| {
+            .and_then(|mut res| {
                 res.flags.merge(flags);
-                res
+                res.raw_value = res
+                    .raw_value
+                    .checked_add(self.symbol_db.definition_addend(symbol_id))?;
+                Some(res)
             })
     }
 
@@ -2697,7 +2701,7 @@ fn traverse_reference_graph<'data, A: Arch>(
     });
 
     let errors: MultiErrorBuilder = take(&mut resources.errors.lock().unwrap());
-    errors.emit_errors_if_any()?;
+    errors.emit_sorted_errors()?;
 
     let mut group_states = unwrap_worker_states(&resources.worker_slots);
 
@@ -3461,6 +3465,27 @@ impl<'data, P: Platform> PreludeLayoutState<'data, P> {
 
         self.load_entry_point::<A>(resources, queue, scope);
 
+        for name in &resources.symbol_db.extra_required_symbols {
+            let id = resources
+                .symbol_db
+                .get_unversioned(&UnversionedSymbolName::prehashed(name))
+                .with_context(|| {
+                    format!(
+                        "Required symbol {} is undefined",
+                        String::from_utf8_lossy(name)
+                    )
+                })?;
+            let id = resources.symbol_db.definition(id);
+            if !resources
+                .per_symbol_flags
+                .get_atomic(id)
+                .fetch_or(ValueFlags::DIRECT)
+                .contains(ValueFlags::DIRECT)
+            {
+                queue.send_symbol_request::<A>(id, resources, scope);
+            }
+        }
+
         P::allocate_prelude(common, resources.symbol_db);
 
         if resources.symbol_db.output_kind.is_dynamic_executable() {
@@ -3829,7 +3854,8 @@ impl<'data, P: Platform> PreludeLayoutState<'data, P> {
                 }
             }
 
-            if !resources.symbol_db.args.should_output_partial_object() {
+            if !resources.symbol_db.args.should_output_partial_object() && !keep_segments.is_empty()
+            {
                 // Always keep the program headers segment even though we don't emit any sections in
                 // it.
                 keep_segments[0] = true;
@@ -6964,12 +6990,32 @@ impl OutputRecordLayout {
     fn merge(&mut self, other: &OutputRecordLayout) {
         debug_assert!(other.mem_offset >= self.mem_offset);
         debug_assert!(other.file_offset >= self.file_offset);
-        self.mem_size += other.mem_size;
-        self.file_size += other.file_size;
+        self.mem_size = self.mem_size.max(other.mem_end() - self.mem_offset);
+        self.file_size = self.file_size.max(other.file_end() - self.file_offset);
         if other.mem_size > 0 {
             self.alignment = self.alignment.max(other.alignment);
         }
     }
+}
+
+#[test]
+fn merged_records_include_alignment_gaps() {
+    let mut first = OutputRecordLayout {
+        file_offset: 10,
+        mem_offset: 100,
+        file_size: 2,
+        mem_size: 2,
+        ..Default::default()
+    };
+    first.merge(&OutputRecordLayout {
+        file_offset: 32,
+        mem_offset: 132,
+        file_size: 1,
+        mem_size: 1,
+        ..Default::default()
+    });
+    assert_eq!(first.file_size, 23);
+    assert_eq!(first.mem_size, 33);
 }
 
 // This implementation is just here so that we can store a Box<dyn Drop> elsewhere in order to erase
@@ -7052,7 +7098,20 @@ fn harvest_and_sort_script_sections<'data, P: Platform>(
         }
     }
 
-    sections_out.sort_by_key(|a| a.0);
+    // Equal names must follow input order, not the order GC discovered sections.
+    let key = |a: &(&'data [u8], InputSortedSection)| {
+        (
+            a.0,
+            a.1.file_id.group(),
+            a.1.file_id.file(),
+            a.1.section_index.0,
+        )
+    };
+    if sections_out.len() >= 16384 {
+        sections_out.par_sort_unstable_by_key(key);
+    } else {
+        sections_out.sort_unstable_by_key(key);
+    }
     sections_out
         .into_iter()
         .map(|(_, harvested)| harvested)

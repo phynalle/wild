@@ -1160,6 +1160,7 @@ impl<'data> platform::VerneedTable<'data> for VerneedTable<'data> {
 }
 
 impl platform::Platform for MachO {
+    type InputResolutionState = ();
     const NUM_SINGLE_PART_SECTIONS: u32 = SinglePartSectionId::Count as u32;
     const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 0;
 

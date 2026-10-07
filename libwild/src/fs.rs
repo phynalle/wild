@@ -74,6 +74,11 @@ pub trait OutputFileData: Send {
     /// Returns the output buffer for random-access writing.
     fn bytes_mut(&mut self) -> &mut [u8];
 
+    /// Whether every byte is initially zero. Custom filesystems need not provide this guarantee.
+    fn initially_zeroed(&self) -> bool {
+        false
+    }
+
     /// Persist the bytes and apply final file attributes.
     fn finish(self) -> Result;
 
@@ -367,9 +372,13 @@ pub struct OsOutputFile {
     file: File,
     buffer: OsOutputBuffer,
     path: Arc<Path>,
+    initially_zeroed: bool,
 }
 
 impl OutputFileData for OsOutputFile {
+    fn initially_zeroed(&self) -> bool {
+        self.initially_zeroed
+    }
     fn bytes(&self) -> &[u8] {
         match &self.buffer {
             OsOutputBuffer::Mmap(mmap) => mmap,
@@ -578,7 +587,14 @@ impl FileSystem for OsFileSystem {
             }
         };
 
-        Ok(OsOutputFile { file, buffer, path })
+        let initially_zeroed = matches!(buffer, OsOutputBuffer::InMemory(_))
+            || options.file_replacement_mode == FileReplacementMode::UnlinkAndReplace;
+        Ok(OsOutputFile {
+            file,
+            buffer,
+            path,
+            initially_zeroed,
+        })
     }
 
     fn write_output(&self, path: Arc<Path>, options: OutputOptions, bytes: &[u8]) -> Result {

@@ -1,4 +1,3 @@
-use super::resolve::Target;
 use crate::bail;
 use crate::ensure;
 use crate::error::Context as _;
@@ -14,43 +13,7 @@ use object::read::coff::ImportName;
 use object::read::coff::ImportType;
 use object::read::coff::Symbol as _;
 use std::num::NonZeroU32;
-use std::num::NonZeroU64;
 use std::ops::Range;
-
-pub(super) type NameId = u32;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct ResolvedTarget(NonZeroU64);
-
-impl ResolvedTarget {
-    pub fn expand(self) -> Target {
-        let raw = self.0.get();
-        match raw >> 62 {
-            0 => Target::Archive((raw - 1) as usize),
-            1 => Target::Symbol(((raw >> 32) & 0x3fff_ffff) as usize, raw as u32 as usize),
-            2 => Target::Import(raw as u32 as usize, raw & (1 << 32) != 0),
-            _ => Target::ImageBase,
-        }
-    }
-    pub fn compress(target: Target) -> Self {
-        // Two high tag bits leave 30 bits for object IDs and all 32 COFF symbol bits.
-        // Object registration checks that bound. Nonzero tags preserve Option's niche.
-        let raw = match target {
-            Target::Symbol(o, s) => {
-                assert!(o < 1 << 30);
-                let s = u32::try_from(s).unwrap();
-                (1 << 62) | ((o as u64) << 32) | u64::from(s)
-            }
-            Target::Import(i, iat) => {
-                let i = u32::try_from(i).unwrap();
-                (2 << 62) | (u64::from(iat) << 32) | u64::from(i)
-            }
-            Target::ImageBase => 3 << 62,
-            Target::Archive(o) => u64::from(u32::try_from(o).unwrap()) + 1,
-        };
-        Self(NonZeroU64::new(raw).unwrap())
-    }
-}
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Reloc {
@@ -70,7 +33,7 @@ impl Reloc {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct ByteRange {
+pub(crate) struct ByteRange {
     pub start: u32,
     pub end: u32,
 }
@@ -109,33 +72,20 @@ pub(super) struct Section {
     pub relocs: ByteRange,
     pub selection: u8,
     pub parent: Option<u32>,
-    pub key: NameId,
     pub key_symbol: Option<u32>,
+    pub anchor_symbol: Option<u32>,
     pub excluded: bool,
     pub tls: bool,
     pub crt: bool,
-    pub replacement: Option<(u32, u32)>,
-    pub live: bool,
-    pub output: usize,
-    pub offset: u32,
 }
 
-impl Section {
-    pub fn excluded(&self) -> bool {
-        self.excluded
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub(super) struct Symbol {
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Symbol {
     pub name: ByteRange,
-    pub name_id: NameId,
     pub section: i32,
     pub value: u32,
     pub class: u8,
     pub weak: Option<(NonZeroU32, u32)>,
-    pub target: Option<ResolvedTarget>,
-    pub gc_marked: bool,
 }
 
 impl Symbol {
@@ -143,40 +93,24 @@ impl Symbol {
         self.weak
             .map(|(index, search)| ((index.get() - 1) as usize, search))
     }
-    pub fn external(&self) -> bool {
-        self.class == 2 || self.class == 105
-    }
-    pub fn definition(&self) -> bool {
-        self.external() && (self.section != 0 || self.value != 0)
-    }
 }
 
 #[derive(Debug, Default)]
 pub(super) struct Object {
-    pub name: String,
     pub sections: Vec<Section>,
     pub symbols: Vec<Symbol>,
     pub directives: Vec<String>,
-    pub active: bool,
     pub child_offsets: Vec<usize>,
     pub children: Vec<usize>,
-    pub input: usize,
-    pub range: Range<usize>,
-    pub order: usize,
-    pub parsed: bool,
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct Import {
+pub(crate) struct Import {
     pub symbol: String,
     pub dll: String,
     pub name: Option<String>,
     pub ordinal: u16,
     pub code: bool,
-    pub live: bool,
-    pub iat: u32,
-    pub thunk: u32,
-    pub order: usize,
 }
 
 pub(super) enum Parsed {
@@ -216,10 +150,6 @@ pub(super) fn parse(data: &[u8], name: String) -> Result<Parsed> {
                 name: import,
                 ordinal,
                 code: file.import_type() == ImportType::Code,
-                live: false,
-                iat: 0,
-                thunk: 0,
-                order: 0,
             }))
         }
         other => bail!("Unsupported COFF input format {other:?} in {name}"),
@@ -264,17 +194,13 @@ fn parse_object<'a, C: CoffHeader>(
             ),
             selection: 0,
             parent: None,
-            key: 0,
             key_symbol: None,
+            anchor_symbol: None,
             excluded: flags & 0x02000800 != 0
                 || section_name.starts_with(".debug")
                 || matches!(section_name, ".drectve" | ".llvm_addrsig"),
             tls: section_name.starts_with(".tls"),
             crt: section_name.starts_with(".CRT$"),
-            replacement: None,
-            live: false,
-            output: 0,
-            offset: 0,
         });
     }
     let table = file.coff_symbol_table();
@@ -285,7 +211,6 @@ fn parse_object<'a, C: CoffHeader>(
         std::str::from_utf8(symbol_name)?;
         let s = Symbol {
             name: byte_range(data, symbol_name),
-            name_id: 0,
             section: symbol.section_number().0,
             value: symbol.value(),
             class: symbol.storage_class().0,
@@ -305,8 +230,6 @@ fn parse_object<'a, C: CoffHeader>(
             } else {
                 None
             },
-            target: None,
-            gc_marked: false,
         };
         ensure!(
             s.section <= sections.len() as i32,
@@ -321,6 +244,9 @@ fn parse_object<'a, C: CoffHeader>(
             let sec = sections
                 .get_mut(s.section as usize - 1)
                 .context("Invalid COFF section symbol")?;
+            if s.value == 0 {
+                sec.anchor_symbol.get_or_insert(index.0 as u32);
+            }
             sec.selection = aux.selection.0;
             if sec.selection == 5 {
                 let n = u32::from(aux.number.get(LE)) | (u32::from(aux.high_number.get(LE)) << 16);
@@ -339,6 +265,20 @@ fn parse_object<'a, C: CoffHeader>(
                 fallback < symbols.len() && !symbols[fallback].name.is_empty(),
                 "Invalid weak fallback in {name}"
             );
+            let mut next = fallback;
+            let mut depth = 0;
+            while let Some((fallback, _)) = symbols[next].weak() {
+                depth += 1;
+                ensure!(
+                    depth < 64,
+                    "Weak external cycle or excessive depth in {name}"
+                );
+                ensure!(
+                    fallback < symbols.len() && !symbols[fallback].name.is_empty(),
+                    "Invalid weak fallback in {name}"
+                );
+                next = fallback;
+            }
         }
     }
     for section in &sections {
@@ -376,30 +316,12 @@ fn parse_object<'a, C: CoffHeader>(
         }
     }
     Ok(Object {
-        name,
         sections,
         symbols,
         directives,
-        active: false,
         child_offsets,
         children,
-        range: 0..data.len(),
-        input: 0,
-        order: 0,
-        parsed: true,
     })
-}
-
-pub(super) fn archive_names(data: &[u8], weak_only: bool) -> Result<Vec<&str>> {
-    match kind(data)? {
-        object::FileKind::Coff => {
-            archive_names_inner(CoffFile::<_, pe::ImageFileHeader>::parse(data)?, weak_only)
-        }
-        object::FileKind::CoffBig => {
-            archive_names_inner(object::read::coff::CoffBigFile::parse(data)?, weak_only)
-        }
-        _ => Ok(Vec::new()),
-    }
 }
 
 pub(super) fn kind(data: &[u8]) -> Result<object::FileKind> {
@@ -408,22 +330,4 @@ pub(super) fn kind(data: &[u8]) -> Result<object::FileKind> {
     } else {
         Ok(object::FileKind::parse(data)?)
     }
-}
-
-fn archive_names_inner<'a, C: CoffHeader>(
-    file: CoffFile<'a, &'a [u8], C>,
-    weak_only: bool,
-) -> Result<Vec<&'a str>> {
-    let table = file.coff_symbol_table();
-    let mut names = Vec::new();
-    for (_, symbol) in table.iter() {
-        let weak = symbol.storage_class() == pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL
-            && symbol.number_of_aux_symbols() > 0;
-        let defined = symbol.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
-            && (symbol.section_number().0 != 0 || symbol.value() != 0);
-        if weak || (!weak_only && defined) {
-            names.push(std::str::from_utf8(symbol.name(table.strings())?)?);
-        }
-    }
-    Ok(names)
 }

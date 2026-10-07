@@ -652,6 +652,7 @@ pub(crate) fn symtab_name_for_strtab(raw_name: &[u8]) -> &[u8] {
 }
 
 impl<C: ElfClass> platform::Platform for Elf<C> {
+    type InputResolutionState = ();
     const NUM_SINGLE_PART_SECTIONS: u32 = ELF_NUM_SINGLE_PART_SECTIONS;
     const NUM_BUILT_IN_REGULAR_SECTIONS: usize = ELF_NUM_BUILT_IN_REGULAR_SECTIONS;
 

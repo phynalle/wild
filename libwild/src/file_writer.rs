@@ -66,6 +66,10 @@ pub(crate) struct SizedOutput<O: OutputFileData> {
 pub(crate) struct OutputBuffer<O: OutputFileData>(O);
 
 impl<O: OutputFileData> OutputBuffer<O> {
+    pub(crate) fn initially_zeroed(&self) -> bool {
+        self.0.initially_zeroed()
+    }
+
     pub(crate) fn invalidate(&mut self, len: usize) {
         self.0.invalidate(len);
     }
@@ -201,7 +205,9 @@ impl<F: FileSystem> Output<F> {
                 wait_for_sized_output(sized_output_recv)?
             }
             FileCreator::Regular { file_size } => {
-                delete_old_output(self.file_system.as_ref(), &self.path);
+                if self.config.file_replacement_mode == FileReplacementMode::UnlinkAndReplace {
+                    delete_old_output(self.file_system.as_ref(), &self.path);
+                }
                 let file_size = file_size.context("set_size was never called")?;
                 self.create_file_non_lazily(file_size)?
             }
