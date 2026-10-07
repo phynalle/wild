@@ -54,6 +54,13 @@ fn symbol_object(name: &str, bytes: &[u8], selection: Option<ComdatKind>, weak: 
 }
 
 fn link_objects(objects: &[Vec<u8>], extra: impl FnOnce(&mut CoffArgs)) -> Result<Vec<u8>> {
+    Ok(link_development_outputs(objects, extra)?.0)
+}
+
+fn link_development_outputs(
+    objects: &[Vec<u8>],
+    extra: impl FnOnce(&mut CoffArgs),
+) -> Result<(Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>)> {
     let temp = tempfile::tempdir().unwrap();
     let mut args = CoffArgs::default();
     args.entry = Some("entry".into());
@@ -72,7 +79,261 @@ fn link_objects(objects: &[Vec<u8>], extra: impl FnOnce(&mut CoffArgs)) -> Resul
     let args = crate::args::Args::Coff(args);
     let linker = crate::Linker::new();
     drop(linker.run(&args)?);
-    Ok(std::fs::read(&output).unwrap())
+    Ok((
+        std::fs::read(&output).unwrap(),
+        std::fs::read(output.with_extension("pdb")).ok(),
+        std::fs::read(output.with_extension("lib")).ok(),
+    ))
+}
+
+#[test]
+fn dll_export_roots_extract_archive_members_and_write_import_library() {
+    let (image, _, library) = link_development_outputs(
+        &[
+            object("entry", &[0xc3], None),
+            archive(&[object("exported", &[0x90, 0xc3], None)]),
+        ],
+        |args| {
+            args.is_dll = true;
+            args.directives.push("/EXPORT:public=exported".into());
+        },
+    )
+    .unwrap();
+    let pe = object::read::pe::PeFile64::parse(&*image).unwrap();
+    let exports: Vec<_> = object::Object::exports(&pe)
+        .unwrap()
+        .map(|export| export.unwrap())
+        .collect();
+    assert_eq!(exports.len(), 1);
+    assert_eq!(
+        exports[0].name(),
+        object::NameOrOrdinal::Name(&b"public"[..])
+    );
+    assert_ne!(
+        u16::from_le_bytes(image[0x96..0x98].try_into().unwrap()) & 0x2000,
+        0
+    );
+    assert!(library.unwrap().starts_with(b"!<arch>\n"));
+}
+
+#[test]
+fn noentry_dll_has_zero_entry_and_dll_image_base() {
+    let image = link_objects(&[object("entry", &[0xc3], None)], |args| {
+        args.is_dll = true;
+        args.no_entry = true;
+        args.entry = None;
+        args.image_base = 0x180000000;
+        args.directives.push("/EXPORT:entry".into());
+    })
+    .unwrap();
+    assert_eq!(u32::from_le_bytes(image[0xa8..0xac].try_into().unwrap()), 0);
+    assert_eq!(
+        u64::from_le_bytes(image[0xb0..0xb8].try_into().unwrap()),
+        0x180000000
+    );
+}
+
+#[test]
+fn debug_output_uses_shared_auxiliary_writer() {
+    let (image, pdb, _) = link_development_outputs(&[object("entry", &[0xc3], None)], |args| {
+        args.debug = true;
+        args.pdb_alt_path = Some("%_PDB%".into());
+    })
+    .unwrap();
+    assert!(
+        pdb.unwrap()
+            .starts_with(b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0")
+    );
+    assert!(image.windows(4).any(|bytes| bytes == b"RSDS"));
+    assert!(image.windows(10).any(|bytes| bytes == b"image.pdb\0"));
+}
+
+#[test]
+fn malformed_debug_is_checked_only_when_debugging_is_enabled() {
+    let mut o = Object::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    let text = o.add_section(Vec::new(), b".text".to_vec(), SectionKind::Text);
+    o.append_section_data(text, &[0xc3], 16);
+    o.add_symbol(Symbol {
+        name: b"entry".to_vec(),
+        value: 0,
+        size: 1,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Linkage,
+        weak: false,
+        section: SymbolSection::Section(text),
+        flags: SymbolFlags::None,
+    });
+    let debug = o.add_section(Vec::new(), b".debug$T".to_vec(), SectionKind::Debug);
+    o.append_section_data(debug, &[4, 0, 0, 0, 10, 0, 1, 0x10], 4);
+    let bytes = o.write().unwrap();
+    assert!(link_objects(&[bytes.clone()], |_| {}).is_ok());
+    assert!(
+        link_objects(
+            &[object("entry", &[0xc3], None), archive(&[bytes.clone()])],
+            |args| args.debug = true
+        )
+        .is_ok()
+    );
+    let error = link_objects(&[bytes], |args| args.debug = true).unwrap_err();
+    assert!(error.to_string().contains("Truncated CodeView record"));
+}
+
+#[test]
+fn debug_address_below_image_base_is_a_link_error() {
+    let mut o = Object::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    let debug = o.add_section(Vec::new(), b".debug$S".to_vec(), SectionKind::Debug);
+    o.append_section_data(debug, &4u32.to_le_bytes(), 4);
+    let symbol = o.add_symbol(Symbol {
+        name: b"absolute".to_vec(),
+        value: 1,
+        size: 0,
+        kind: SymbolKind::Data,
+        scope: SymbolScope::Linkage,
+        weak: false,
+        section: SymbolSection::Absolute,
+        flags: SymbolFlags::None,
+    });
+    o.add_relocation(
+        debug,
+        Relocation {
+            offset: 0,
+            symbol,
+            addend: 0,
+            flags: RelocationFlags::Coff {
+                typ: object::pe::IMAGE_REL_AMD64_ADDR32NB,
+            },
+        },
+    )
+    .unwrap();
+    let error = link_objects(
+        &[object("entry", &[0xc3], None), o.write().unwrap()],
+        |args| args.debug = true,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("Debug ADDR32NB overflow"), "{error}");
+}
+
+#[test]
+fn conflicting_outputs_are_rejected_before_truncating_image() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("sentinel.exe");
+    std::fs::write(&path, b"sentinel").unwrap();
+    let mut args = CoffArgs::default();
+    args.common.output = Arc::from(path.clone());
+    args.debug = true;
+    args.pdb = Some(Arc::from(temp.path().join("./sentinel.exe")));
+    let linker = crate::Linker::new();
+    let args = crate::args::Args::Coff(args);
+    let error = linker.run(&args).err().unwrap();
+    assert!(error.to_string().contains("Conflicting output path"));
+    assert_eq!(std::fs::read(path).unwrap(), b"sentinel");
+}
+
+#[test]
+fn late_export_output_conflict_preserves_existing_outputs() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input.obj");
+    std::fs::write(&input, object("entry", &[0xc3], None)).unwrap();
+    let directives = temp.path().join("directives.obj");
+    let mut o = Object::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    let section = o.add_section(Vec::new(), b".drectve".to_vec(), SectionKind::Linker);
+    o.append_section_data(section, b"/EXPORT:entry", 1);
+    std::fs::write(&directives, o.write().unwrap()).unwrap();
+    let output = temp.path().join("image.exe");
+    let sidecar = output.with_extension("lib");
+    std::fs::write(&output, b"image sentinel").unwrap();
+    std::fs::write(&sidecar, b"sidecar sentinel").unwrap();
+    let mut args = CoffArgs::default();
+    args.entry = Some("entry".into());
+    args.debug = true;
+    args.pdb = Some(Arc::from(sidecar.clone()));
+    args.common.output = Arc::from(output.clone());
+    args.common.inputs.push(Input {
+        spec: InputSpec::File(input.into()),
+        modifiers: Modifiers::default(),
+        search_first: None,
+    });
+    args.common.inputs.push(Input {
+        spec: InputSpec::File(directives.into()),
+        modifiers: Modifiers::default(),
+        search_first: None,
+    });
+    let linker = crate::Linker::new();
+    let error = linker
+        .run(&crate::args::Args::Coff(args))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("Conflicting output path"), "{error}");
+    assert_eq!(std::fs::read(output).unwrap(), b"image sentinel");
+    assert_eq!(std::fs::read(sidecar).unwrap(), b"sidecar sentinel");
+}
+
+#[test]
+fn auxiliary_output_failure_is_a_link_failure() {
+    for extension in ["pdb", "lib"] {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input.obj");
+        std::fs::write(&input, object("entry", &[0xc3], None)).unwrap();
+        let output = temp.path().join("image.dll");
+        std::fs::create_dir(output.with_extension(extension)).unwrap();
+        let mut args = CoffArgs::default();
+        args.entry = Some("entry".into());
+        args.is_dll = true;
+        args.debug = true;
+        args.common.output = Arc::from(output);
+        args.directives.push("/EXPORT:entry".into());
+        args.common.inputs.push(Input {
+            spec: InputSpec::File(input.into()),
+            modifiers: Modifiers::default(),
+            search_first: None,
+        });
+        let linker = crate::Linker::new();
+        assert!(linker.run(&crate::args::Args::Coff(args)).is_err());
+    }
+}
+
+#[test]
+fn development_outputs_are_thread_and_write_mode_independent() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input.obj");
+    std::fs::write(&input, object("entry", &[0xc3], None)).unwrap();
+    let output = temp.path().join("image.dll");
+    let mut expected = None;
+    for threads in [1, 2, 4] {
+        for mode in [
+            crate::fs::FileWriteMode::BufferThenWrite,
+            crate::fs::FileWriteMode::Mmap,
+        ] {
+            let mut args = CoffArgs::default();
+            args.entry = Some("entry".into());
+            args.is_dll = true;
+            args.debug = true;
+            args.common.output = Arc::from(output.clone());
+            args.common.available_threads = std::num::NonZeroUsize::new(threads).unwrap();
+            args.common.file_write_mode = Some(mode);
+            args.directives.push("/EXPORT:entry".into());
+            args.common.inputs.push(Input {
+                spec: InputSpec::File(input.clone().into()),
+                modifiers: Modifiers::default(),
+                search_first: None,
+            });
+            let linker = crate::Linker::new();
+            let args = crate::args::Args::Coff(args);
+            drop(linker.run(&args).unwrap());
+            let actual = (
+                std::fs::read(&output).unwrap(),
+                std::fs::read(output.with_extension("pdb")).unwrap(),
+                std::fs::read(output.with_extension("lib")).unwrap(),
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(&actual, expected);
+            } else {
+                expected = Some(actual);
+            }
+        }
+    }
 }
 
 #[test]

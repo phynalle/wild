@@ -24,6 +24,7 @@ crossbeam-utils.workspace = true
 derive_more.workspace = true
 flate2.workspace = true
 foldhash.workspace = true
+crc32fast.workspace = true
 gimli.workspace = true
 glob.workspace = true
 hashbrown.workspace = true

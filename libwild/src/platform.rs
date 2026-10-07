@@ -410,6 +410,11 @@ pub(crate) trait Platform:
     type StubLibraryLayoutExt: std::fmt::Debug + Send + Sync + 'static;
     type ArchIdentifier: Send + Sync + 'static;
     type Args: Args;
+
+    /// Validate main and format-specific output identities before opening any output.
+    fn validate_output_paths<F: FileSystem>(_args: &Self::Args, _file_system: &F) -> Result {
+        Ok(())
+    }
     type ResolutionExt: Default + std::fmt::Debug + Copy + Send + Sync + 'static;
     type SymtabShndxEntry: std::fmt::Debug + Default + Send + Sync + 'static;
     type ResolvedObjectExt<'data>: Default + std::fmt::Debug + Send + Sync;
@@ -1103,6 +1108,9 @@ pub(crate) trait Platform:
     /// Whether the symbol table's first entry (index 0) is a reserved null / sentinel entry that
     /// should be excluded from name resolution. `true` for ELF (`STN_UNDEF`).
     const HAS_NULL_SYMBOL_ENTRY: bool = false;
+
+    /// Whether shared outputs use the engine's dynamic symbol table machinery.
+    const USES_DYNAMIC_SYMBOL_TABLE: bool = true;
 
     const CACHE_PREFERRED_SYMBOLS: bool = false;
     /// Uses dense ranks in section-name order instead of repeatedly comparing names.

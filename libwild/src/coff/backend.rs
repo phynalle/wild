@@ -114,6 +114,7 @@ impl platform::Platform for Coff {
         Some(SectionIdentity::new(name, ()))
     }
     type InputResolutionState = InputState;
+    const USES_DYNAMIC_SYMBOL_TABLE: bool = false;
     const CACHE_PREFERRED_SYMBOLS: bool = true;
     const BUCKET_SORTED_SECTIONS: bool = true;
     fn section_sort_rank(section: &Section) -> usize {
@@ -123,6 +124,9 @@ impl platform::Platform for Coff {
         db: &'a SymbolDb<Self>,
         inferred: Option<&'a [u8]>,
     ) -> platform::EntryPoint<'a> {
+        if db.args.no_entry {
+            return platform::EntryPoint::None;
+        }
         if let Some(entry) = &db.args.entry {
             return platform::EntryPoint::Symbol(entry.as_bytes());
         }
@@ -428,6 +432,53 @@ impl platform::Platform for Coff {
         let mut changed = false;
         if !state.initialized {
             state.initialized = true;
+            if db.args.debug {
+                let mut assets = Vec::new();
+                for path in &db.args.natvis {
+                    assets.push(super::pdb::Asset {
+                        name: path.to_string_lossy().into_owned(),
+                        data: loader.load_auxiliary(path)?,
+                    });
+                }
+                let absolute = loader
+                    .file_system()
+                    .absolute_path(&super::pdb::output_path(db.args))?;
+                let bytes = super::pdb::directory_object(db.args, &absolute)?;
+                let data = db.herd.get().alloc_slice_copy(&bytes);
+                let mut object = File::parse_coff(data, "<PE debug directory>".into())?;
+                object.auxiliary = Some(Box::new(FileAuxiliary::DebugAssets(
+                    assets.into_boxed_slice(),
+                )));
+                db.extra_required_symbols.push(b"__wild_debug_directory");
+                db.add_inputs(
+                    flags,
+                    sections,
+                    rules,
+                    crate::input_data::LoadedInputs {
+                        objects: vec![Ok(Box::new(crate::parsing::ParsedInputObject {
+                            input: crate::input_data::InputRef {
+                                file: crate::input_data::InputFileRef::synthetic(
+                                    std::path::Path::new("<PE debug directory>"),
+                                ),
+                                data,
+                                entry: None,
+                            },
+                            object,
+                            modifiers: Default::default(),
+                        }))],
+                        linker_scripts: Vec::new(),
+                        stub_libraries: Vec::new(),
+                        lto_objects: Vec::new(),
+                    },
+                )?;
+                changed = true;
+            }
+            if let Some(path) = &db.args.definition_file {
+                let bytes = loader.load_auxiliary(path)?;
+                for export in super::exports::parse_definition(std::str::from_utf8(bytes)?)? {
+                    register_export(state, db, export)?;
+                }
+            }
             state.no_default_libraries = db.args.no_default_libraries;
             state.excluded.extend(
                 db.args
@@ -465,7 +516,7 @@ impl platform::Platform for Coff {
         for text in texts {
             changed |= directive(state, db, &text)?;
         }
-        if db.args.entry.is_none() {
+        if db.args.entry.is_none() && !db.args.no_entry {
             let entry = inferred_entry(db, |id| state.processed.contains(&id));
             changed |= db.entry_symbol_name() != Some(entry);
             db.set_inferred_entry(entry);
@@ -545,6 +596,39 @@ impl platform::Platform for Coff {
             changed = true;
         }
         if !changed {
+            if !state.exports_created && !state.exports.is_empty() {
+                validate_output_paths(db.args, loader.file_system(), true)?;
+                state.exports_created = true;
+                let exports: Vec<_> = state.exports.values().cloned().collect();
+                let bytes = super::exports::object(db.args, &exports)?;
+                let data = db.herd.get().alloc_slice_copy(&bytes);
+                let mut object = File::parse_coff(data, "<PE exports>".into())?;
+                object.auxiliary =
+                    Some(Box::new(FileAuxiliary::Exports(exports.into_boxed_slice())));
+                db.extra_required_symbols.push(b"__wild_export_directory");
+                db.add_inputs(
+                    flags,
+                    sections,
+                    rules,
+                    crate::input_data::LoadedInputs {
+                        objects: vec![Ok(Box::new(crate::parsing::ParsedInputObject {
+                            input: crate::input_data::InputRef {
+                                file: crate::input_data::InputFileRef::synthetic(
+                                    std::path::Path::new("<PE exports>"),
+                                ),
+                                data,
+                                entry: None,
+                            },
+                            object,
+                            modifiers: Default::default(),
+                        }))],
+                        linker_scripts: Vec::new(),
+                        stub_libraries: Vec::new(),
+                        lto_objects: Vec::new(),
+                    },
+                )?;
+                return Ok(true);
+            }
             if !state.imports_created {
                 state.imports_created = true;
                 let mut imports = Vec::new();
@@ -881,11 +965,50 @@ impl platform::Platform for Coff {
     type GcUnit = layout::SectionGcUnit;
     type SectionIdentityExt = ();
 
+    fn validate_output_paths<F: FileSystem>(args: &Self::Args, fs: &F) -> Result {
+        validate_output_paths(args, fs, false)
+    }
+
     fn write_output_file<'data, A: Arch<Platform = Self>, F: FileSystem>(
         output: &crate::file_writer::Output<F>,
         layout: &Layout<'data, Self>,
     ) -> Result {
-        output.write(layout, super::pe_writer::write)
+        let pdb = if layout.args().debug {
+            Some(super::pdb::build(layout)?)
+        } else {
+            None
+        };
+        output.write(layout, |out, layout| {
+            super::pe_writer::write(out, layout, pdb.as_ref())
+        })?;
+        let pdb_path = pdb.as_ref().map(|pdb| pdb.path.clone());
+        if let Some(pdb) = pdb {
+            pdb.write(output)?;
+        }
+        for group in &layout.group_layouts {
+            for file in &group.files {
+                if let layout::FileLayout::Object(object) = file {
+                    if let Some(exports) = object.object.export_definitions() {
+                        let path = layout.args().import_library.clone().unwrap_or_else(|| {
+                            std::sync::Arc::from(layout.args().common.output.with_extension("lib"))
+                        });
+                        crate::ensure!(
+                            path != layout.args().common.output,
+                            "Import library and image paths conflict"
+                        );
+                        crate::ensure!(
+                            pdb_path.as_ref().is_none_or(|pdb| *pdb != path),
+                            "PDB and import library paths conflict"
+                        );
+                        output.write_auxiliary(
+                            &path,
+                            &super::exports::import_library(layout.args(), exports)?,
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
     fn section_attributes(header: &Self::SectionHeader) -> Self::SectionAttributes {
         Attributes(header.output_flags.load(Ordering::Relaxed) & 0xfe0000e0)
@@ -1416,6 +1539,8 @@ pub(crate) struct InputState {
     no_default_libraries: bool,
     whole_archive: bool,
     imports_created: bool,
+    exports_created: bool,
+    exports: std::collections::BTreeMap<String, super::exports::Export>,
     pending: Vec<(String, bool)>,
     mismatch: std::collections::BTreeMap<String, String>,
     merges: std::collections::BTreeMap<String, String>,
@@ -1429,10 +1554,57 @@ fn library_key(name: &str) -> String {
         .to_owned()
 }
 
+fn validate_output_paths<F: FileSystem>(args: &CoffArgs, fs: &F, has_exports: bool) -> Result {
+    let mut paths = vec![args.common.output.clone()];
+    if args.debug {
+        paths.push(super::pdb::output_path(args));
+    }
+    if has_exports
+        || args.is_dll
+        || args.import_library.is_some()
+        || args.definition_file.is_some()
+        || args
+            .directives
+            .iter()
+            .any(|d| d.to_ascii_lowercase().starts_with("/export:"))
+    {
+        paths.push(
+            args.import_library
+                .clone()
+                .unwrap_or_else(|| std::sync::Arc::from(args.common.output.with_extension("lib"))),
+        );
+    }
+    let mut identities = std::collections::BTreeSet::new();
+    for path in paths {
+        let absolute = fs.absolute_path(&path)?;
+        let absolute = fs.canonicalize(&absolute).unwrap_or(absolute);
+        let mut normalized = std::path::PathBuf::new();
+        for component in absolute.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    normalized.pop();
+                }
+                _ => normalized.push(component.as_os_str()),
+            }
+        }
+        let identity = crate::host::fs::path_collision_key(&normalized);
+        crate::ensure!(
+            identities.insert(identity),
+            "Conflicting output path: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 fn inferred_entry(
     db: &SymbolDb<Coff>,
     selected: impl Fn(crate::input_data::FileId) -> bool,
 ) -> &'static [u8] {
+    if db.args.is_dll {
+        return b"_DllMainCRTStartup";
+    }
     for (name, entry) in [
         (b"wmain".as_slice(), b"wmainCRTStartup".as_slice()),
         (b"WinMain".as_slice(), b"WinMainCRTStartup".as_slice()),
@@ -1462,6 +1634,7 @@ fn directive(state: &mut InputState, db: &mut SymbolDb<Coff>, text: &str) -> Res
     let text = text.trim_start_matches(['/', '-']);
     let (name, value) = text.split_once(':').unwrap_or((text, ""));
     match name.to_ascii_lowercase().as_str() {
+        "export" => return register_export(state, db, super::exports::parse_export(value)?),
         "defaultlib" => state.pending.push((value.into(), false)),
         "nodefaultlib" => {
             if value.is_empty() {
@@ -1520,6 +1693,25 @@ fn directive(state: &mut InputState, db: &mut SymbolDb<Coff>, text: &str) -> Res
         _ => bail!("Unsupported COFF directive /{text}"),
     }
     Ok(false)
+}
+
+fn register_export(
+    state: &mut InputState,
+    db: &mut SymbolDb<Coff>,
+    export: super::exports::Export,
+) -> Result<bool> {
+    if let Some(old) = state.exports.get(&export.name) {
+        crate::ensure!(old == &export, "Conflicting export {}", export.name);
+        return Ok(false);
+    }
+    crate::ensure!(
+        !state.exports_created,
+        "Export added after export directory was finalized"
+    );
+    let name = db.herd.get().alloc_slice_copy(export.target.as_bytes());
+    db.extra_required_symbols.push(name);
+    state.exports.insert(export.name.clone(), export);
+    Ok(true)
 }
 
 pub(crate) struct FinalSizes {
@@ -1605,6 +1797,13 @@ pub(crate) struct File<'data> {
     materialized: std::sync::OnceLock<Box<FileContents<'data>>>,
     deferred: bool,
     catalog_excluded: Vec<bool>,
+    auxiliary: Option<Box<FileAuxiliary<'data>>>,
+}
+
+#[derive(Debug)]
+enum FileAuxiliary<'data> {
+    Exports(Box<[super::exports::Export]>),
+    DebugAssets(Box<[super::pdb::Asset<'data>]>),
 }
 
 #[derive(Debug)]
@@ -1859,6 +2058,20 @@ impl platform::SectionAttributes for Attributes {
 }
 
 impl<'data> File<'data> {
+    pub(super) fn export_definitions(&self) -> Option<&[super::exports::Export]> {
+        match self.auxiliary.as_deref() {
+            Some(FileAuxiliary::Exports(exports)) => Some(exports),
+            _ => None,
+        }
+    }
+
+    pub(super) fn pdb_assets(&self) -> Option<&[super::pdb::Asset<'data>]> {
+        match self.auxiliary.as_deref() {
+            Some(FileAuxiliary::DebugAssets(assets)) => Some(assets),
+            _ => None,
+        }
+    }
+
     fn parse_coff(data: &'data [u8], name: String) -> Result<Self> {
         let contents = match input::parse(data, name)? {
             input::Parsed::Object(object) => Self::object_contents(object),
@@ -1885,6 +2098,7 @@ impl<'data> File<'data> {
             materialized: Default::default(),
             deferred: false,
             catalog_excluded: Vec::new(),
+            auxiliary: None,
         })
     }
 
@@ -2179,6 +2393,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
                     materialized: Default::default(),
                     deferred: true,
                     catalog_excluded: object.excluded,
+                    auxiliary: None,
                 });
             }
         }

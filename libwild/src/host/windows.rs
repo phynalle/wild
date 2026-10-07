@@ -39,6 +39,10 @@ pub(crate) mod fs {
         PathBuf::from(path)
     }
 
+    pub(crate) fn path_collision_key(path: &Path) -> String {
+        path.to_string_lossy().to_lowercase()
+    }
+
     pub(crate) fn create_symlink(target: &Path, dest_path: &Path) -> std::io::Result<()> {
         use std::os::windows::fs::FileTypeExt as _;
         let is_dir = std::fs::metadata(target).is_ok_and(|meta| meta.is_dir());

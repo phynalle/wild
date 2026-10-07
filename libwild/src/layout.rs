@@ -768,7 +768,8 @@ fn append_prelude_defsym_dynamic_symbols<'data, P: Platform>(
     symbol_db: &SymbolDb<'data, P>,
     dynamic_symbol_definitions: &mut Vec<DynamicSymbolDefinition<'data, P>>,
 ) -> Result {
-    if symbol_db.output_kind.needs_dynsym()
+    if P::USES_DYNAMIC_SYMBOL_TABLE
+        && symbol_db.output_kind.needs_dynsym()
         && let Some(first_group) = group_states.first()
         && let Some(FileLayoutState::Prelude(prelude)) = first_group.files.first()
     {
@@ -4096,7 +4097,10 @@ impl<'data, P: Platform> InternalSymbols<'data, P> {
             .get_atomic(symbol_id)
             .fetch_or(ValueFlags::EXPORT_DYNAMIC);
 
-        if !old_flags.needs_export_dynamic() && resources.symbol_db.output_kind.needs_dynsym() {
+        if P::USES_DYNAMIC_SYMBOL_TABLE
+            && !old_flags.needs_export_dynamic()
+            && resources.symbol_db.output_kind.needs_dynsym()
+        {
             export_dynamic(common, symbol_id, resources.symbol_db)?;
         }
 
@@ -4520,6 +4524,9 @@ pub(crate) fn export_symbols_mode<P: Platform>(
     symbol_db: &SymbolDb<P>,
     input: &InputRef,
 ) -> Option<ExportSymbolsMode> {
+    if !P::USES_DYNAMIC_SYMBOL_TABLE {
+        return None;
+    }
     if symbol_db.output_kind == OutputKind::SharedObject
         && (!input.has_archive_semantics()
             || symbol_db.args.should_export_dynamic(input.lib_name()))

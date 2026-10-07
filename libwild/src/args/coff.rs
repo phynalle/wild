@@ -5,7 +5,6 @@ use crate::args::OptionSyntax;
 use crate::bail;
 use crate::error::Result;
 use crate::platform;
-use crate::platform::Args as _;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -30,6 +29,15 @@ pub struct CoffArgs {
     pub(crate) entry: Option<String>,
     pub(crate) subsystem: Option<Subsystem>,
     pub(crate) is_dll: bool,
+    pub(crate) no_entry: bool,
+    pub(crate) definition_file: Option<Box<Path>>,
+    pub(crate) import_library: Option<Arc<Path>>,
+    pub(crate) debug: bool,
+    pub(crate) pdb: Option<Arc<Path>>,
+    pub(crate) pdb_alt_path: Option<String>,
+    pub(crate) natvis: Vec<Box<Path>>,
+    gc_explicit: bool,
+    base_explicit: bool,
     pub(crate) machine: CoffMachine,
     pub(crate) lib_search_path: Vec<Box<Path>>,
     pub(crate) default_libraries: Vec<String>,
@@ -74,6 +82,15 @@ impl Default for CoffArgs {
             entry: None,
             subsystem: None,
             is_dll: false,
+            no_entry: false,
+            definition_file: None,
+            import_library: None,
+            debug: false,
+            pdb: None,
+            pdb_alt_path: None,
+            natvis: Vec::new(),
+            gc_explicit: false,
+            base_explicit: false,
             machine: CoffMachine::X86_64,
             lib_search_path: Vec::new(),
             default_libraries: Vec::new(),
@@ -121,6 +138,9 @@ impl platform::Args for CoffArgs {
     }
 
     fn entry_point<'a>(&'a self, inferred_entry: Option<&'a [u8]>) -> platform::EntryPoint<'a> {
+        if self.no_entry {
+            return platform::EntryPoint::None;
+        }
         self.entry.as_deref().map_or(
             platform::EntryPoint::Symbol(inferred_entry.unwrap_or(b"mainCRTStartup")),
             |entry| platform::EntryPoint::Symbol(entry.as_bytes()),
@@ -182,6 +202,10 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(args: &mut CoffArgs, i
     }
 
     args.common.report_unrecognized()?;
+    crate::ensure!(
+        !args.no_entry || (args.is_dll && args.entry.is_none()),
+        "/NOENTRY requires /DLL and cannot be combined with /ENTRY"
+    );
     for input in &mut args.common.inputs {
         if input.search_first.is_none() {
             input.search_first = Some(std::path::PathBuf::from("."));
@@ -229,10 +253,6 @@ const COFF_OPTION_SYNTAX: OptionSyntax = OptionSyntax {
 /// These appear on virtually every link line, so warning about them would be pure noise. The value,
 /// if any, is ignored too.
 const SILENTLY_IGNORED_FLAGS: &[&str] = &[
-    // PDB paths and debugger visualisers, which relate to debug info we don't emit.
-    "pdb",
-    "pdbaltpath",
-    "natvis",
     // Manifest generation and warnings-as-errors, e.g. `/MANIFEST:EMBED`, `/MANIFESTUAC:NO`,
     // `/MANIFESTINPUT:foo.manifest`, `/WX:NO`.
     "manifest",
@@ -250,8 +270,6 @@ const IGNORED_FLAGS: &[&str] = &[
     // Control-flow guard, which we don't emit. `/DEBUG` is handled separately, since its `NONE`
     // value requests exactly what we do.
     "guard",
-    // An import library and a module definition file, which we don't produce.
-    "implib", "def",
 ];
 
 /// Ignored options that take no value, so `/NOLOGO:x` is an error just like `/DLL:x` is.
@@ -349,6 +367,28 @@ fn setup_argument_parser() -> ArgumentParser<CoffArgs> {
         .help("Build a DLL rather than an executable")
         .execute(|args, _modifier_stack| {
             args.is_dll = true;
+            if !args.base_explicit {
+                args.image_base = 0x180000000;
+            }
+            Ok(())
+        });
+
+    parser.declare().long("noentry").execute(|args, _| {
+        args.no_entry = true;
+        Ok(())
+    });
+    parser
+        .declare_with_param()
+        .long("def")
+        .execute(|args, _, value| {
+            args.definition_file = Some(Box::from(Path::new(value)));
+            Ok(())
+        });
+    parser
+        .declare_with_param()
+        .long("implib")
+        .execute(|args, _, value| {
+            args.import_library = Some(Arc::from(Path::new(value)));
             Ok(())
         });
 
@@ -399,17 +439,40 @@ fn setup_argument_parser() -> ArgumentParser<CoffArgs> {
             Ok(())
         });
 
-    // `/DEBUG:NONE` asks for no debug info, which is what we produce, so only the forms that
-    // request a PDB warn.
     parser
         .declare_with_optional_param()
         .long("debug")
         .execute(|args, _modifier_stack, value| {
             match value {
-                Some(value) if value.eq_ignore_ascii_case("none") => {}
-                Some(value) => args.warn_unsupported(&format!("/DEBUG:{value}"))?,
-                None => args.warn_unsupported("/DEBUG")?,
+                Some(value) if value.eq_ignore_ascii_case("none") => args.debug = false,
+                Some(value) if value.eq_ignore_ascii_case("full") => args.debug = true,
+                None => args.debug = true,
+                Some(value) => bail!("Unsupported /DEBUG value {value}; use FULL or NONE"),
             }
+            if !args.gc_explicit {
+                args.gc = !args.debug;
+            }
+            Ok(())
+        });
+    parser
+        .declare_with_param()
+        .long("pdb")
+        .execute(|args, _, value| {
+            args.pdb = Some(Arc::from(Path::new(value)));
+            Ok(())
+        });
+    parser
+        .declare_with_param()
+        .long("pdbaltpath")
+        .execute(|args, _, value| {
+            args.pdb_alt_path = Some(value.into());
+            Ok(())
+        });
+    parser
+        .declare_with_param()
+        .long("natvis")
+        .execute(|args, _, value| {
+            args.natvis.push(Box::from(Path::new(value)));
             Ok(())
         });
 
@@ -469,6 +532,7 @@ fn setup_argument_parser() -> ArgumentParser<CoffArgs> {
     directive!("failifmismatch");
     directive!("merge");
     directive!("section");
+    directive!("export");
     parser
         .declare_with_optional_param()
         .long("wholearchive")
@@ -484,8 +548,14 @@ fn setup_argument_parser() -> ArgumentParser<CoffArgs> {
         .execute(|args, _, value| {
             for option in value.split(',') {
                 match option.to_ascii_lowercase().as_str() {
-                    "ref" => args.gc = true,
-                    "noref" => args.gc = false,
+                    "ref" => {
+                        args.gc = true;
+                        args.gc_explicit = true;
+                    }
+                    "noref" => {
+                        args.gc = false;
+                        args.gc_explicit = true;
+                    }
                     "noicf" | "icf" => {}
                     _ => bail!("Unsupported /OPT value {option}"),
                 }
@@ -497,6 +567,7 @@ fn setup_argument_parser() -> ArgumentParser<CoffArgs> {
         .long("base")
         .execute(|args, _, value| {
             args.image_base = crate::args::parse_number(value)?;
+            args.base_explicit = true;
             Ok(())
         });
     parser
@@ -661,6 +732,45 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::Mutex;
+
+    #[test]
+    fn debug_defaults_and_explicit_gc_are_order_independent() {
+        for options in [["/DEBUG", "/OPT:REF"], ["/OPT:REF", "/DEBUG"]] {
+            let args = parse_args(options);
+            assert!(args.debug && args.gc);
+        }
+        assert!(!parse_args(["/DEBUG:FULL"]).gc);
+        assert!(!parse_args(["/DEBUG", "/DEBUG:NONE"]).debug);
+        assert!(parse_args(["/DEBUG:NONE", "/DEBUG"]).debug);
+    }
+
+    #[test]
+    fn dll_entry_and_output_options() {
+        let args = parse_args([
+            "/DLL",
+            "/NOENTRY",
+            "/DEF:exports.def",
+            "/IMPLIB:a.lib",
+            "/PDB:a.pdb",
+            "/PDBALTPATH:%_PDB%",
+            "/NATVIS:rust.natvis",
+        ]);
+        assert!(args.is_dll && args.no_entry);
+        assert_eq!(args.image_base, 0x180000000);
+        assert_eq!(
+            args.definition_file.as_deref(),
+            Some(Path::new("exports.def"))
+        );
+        assert_eq!(args.import_library.as_deref(), Some(Path::new("a.lib")));
+        assert_eq!(args.pdb.as_deref(), Some(Path::new("a.pdb")));
+        assert_eq!(args.natvis[0].as_ref(), Path::new("rust.natvis"));
+        for options in [["/BASE:0x140000000", "/DLL"], ["/DLL", "/BASE:0x140000000"]] {
+            assert_eq!(parse_args(options).image_base, 0x140000000);
+        }
+        for options in [vec!["/NOENTRY"], vec!["/DLL", "/NOENTRY", "/ENTRY:entry"]] {
+            assert!(parse(&mut CoffArgs::default(), options.into_iter()).is_err());
+        }
+    }
 
     /// A link line of the shape that rustc emits when targeting `x86_64-pc-windows-msvc`.
     const RUSTC_LINK_LINE: &[&str] = &[
@@ -936,13 +1046,7 @@ mod tests {
 
     #[test]
     fn unsupported_options_warn() {
-        let unsupported = [
-            "/DEBUG",
-            "/DEBUG:FULL",
-            "/IMPLIB:out.lib",
-            "/DEF:exports.def",
-            "/guard:cf",
-        ];
+        let unsupported = ["/guard:cf"];
 
         for arg in unsupported {
             let (args, warnings) = parse_capturing_warnings([arg, "main.obj"]);
@@ -958,24 +1062,17 @@ mod tests {
         }
     }
 
-    /// The two warning paths quote the option differently. Flags in `IGNORED_FLAGS` reach
-    /// `warn_unsupported` through the unrecognized-option fallback, which still has the whole
-    /// argument, so they echo the user's spelling. `/DEBUG` is declared, so its handler sees only
-    /// the value and has to rebuild the name in canonical form.
     #[test]
-    fn warnings_quote_the_users_spelling_except_for_debug() {
-        let (_args, warnings) = parse_capturing_warnings(["/implib:Foo.lib"]);
-        assert_eq!(warnings, ["/implib:Foo.lib is not yet supported"]);
-
-        let (_args, warnings) = parse_capturing_warnings(["/debug:full"]);
-        assert_eq!(warnings, ["/DEBUG:full is not yet supported"]);
+    fn warnings_quote_the_users_spelling() {
+        let (_args, warnings) = parse_capturing_warnings(["/GuArD:cf"]);
+        assert_eq!(warnings, ["/GuArD:cf is not yet supported"]);
     }
 
     #[test]
     fn unsupported_options_warn_with_a_dash_prefix() {
-        let (_args, warnings) = parse_capturing_warnings(["-IMPLIB:foo.lib"]);
+        let (_args, warnings) = parse_capturing_warnings(["-GUARD:cf"]);
 
-        assert_eq!(warnings, ["-IMPLIB:foo.lib is not yet supported"]);
+        assert_eq!(warnings, ["-GUARD:cf is not yet supported"]);
     }
 
     #[test]

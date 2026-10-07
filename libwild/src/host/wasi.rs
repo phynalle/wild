@@ -60,6 +60,10 @@ pub(crate) mod fs {
         std::path::Path::new(OsStr::from_bytes(bytes)).to_path_buf()
     }
 
+    pub(crate) fn path_collision_key(path: &Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
+
     pub(crate) fn create_symlink(_target: &Path, _dest_path: &Path) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,

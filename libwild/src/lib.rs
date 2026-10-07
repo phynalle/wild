@@ -391,7 +391,6 @@ impl<F: FileSystem> Linker<F> {
 
         match args {
             Args::Coff(args) => {
-                crate::ensure!(!args.is_dll, "COFF DLL output is not supported yet");
                 self.link_for_arch::<coff::backend::Coff, coff::backend::CoffX64>(args)
             }
             Args::Elf(elf_args) => crate::elf::link_for_arch(self, elf_args),
@@ -404,6 +403,7 @@ impl<F: FileSystem> Linker<F> {
         &'data self,
         args: &'data P::Args,
     ) -> error::Result<LinkerOutput<'data>> {
+        P::validate_output_paths(args, self.file_system.as_ref())?;
         let mut file_loader = input_data::FileLoader::new(
             &self.inputs_arena,
             std::sync::Arc::clone(&self.file_system),

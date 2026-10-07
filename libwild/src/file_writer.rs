@@ -101,6 +101,42 @@ struct SectionAllocation {
 }
 
 impl<F: FileSystem> Output<F> {
+    pub(crate) fn write_auxiliary_with(
+        &self,
+        path: &Path,
+        size: u64,
+        writer: impl FnOnce(&mut [u8]) -> Result,
+    ) -> Result {
+        if self.config.file_replacement_mode == FileReplacementMode::UnlinkAndReplace {
+            self.file_system.remove_output_if_exists(path)?;
+        }
+        let mut file = self.file_system.create_output(
+            Arc::from(path),
+            OutputOptions {
+                size,
+                file_replacement_mode: self.config.file_replacement_mode,
+                write_mode: self.config.file_write_mode,
+                fallocate: self.config.fallocate,
+                madvise_huge_pages: self.config.madvise_huge_pages,
+            },
+        )?;
+        writer(file.bytes_mut())?;
+        file.finish()
+    }
+
+    pub(crate) fn write_auxiliary(&self, path: &Path, bytes: &[u8]) -> Result {
+        self.file_system.write_auxiliary_output(
+            Arc::from(path),
+            OutputOptions {
+                size: bytes.len() as u64,
+                file_replacement_mode: self.config.file_replacement_mode,
+                write_mode: self.config.file_write_mode,
+                fallocate: self.config.fallocate,
+                madvise_huge_pages: self.config.madvise_huge_pages,
+            },
+            bytes,
+        )
+    }
     pub(crate) fn new<P: Platform>(
         args: &P::Args,
         output_kind: OutputKind,

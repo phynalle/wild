@@ -9,6 +9,7 @@ pub(crate) use super::imp::fs::invalidate_mapped_output;
 pub(crate) use super::imp::fs::make_executable;
 pub(crate) use super::imp::fs::may_have_multiple_links;
 pub(crate) use super::imp::fs::output_is_busy;
+pub(crate) use super::imp::fs::path_collision_key;
 pub(crate) use super::imp::fs::path_from_bytes;
 pub(crate) use super::imp::fs::preallocate;
 pub(crate) use super::imp::fs::read_input;

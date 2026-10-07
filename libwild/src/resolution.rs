@@ -1424,7 +1424,8 @@ fn canonicalise_undefined_symbols<'data, P: Platform>(
                             let output_kind = symbol_db.output_kind;
                             let visibility = symbol_db.input_symbol_visibility(undefined.symbol_id);
 
-                            if visibility == Visibility::Default
+                            if P::USES_DYNAMIC_SYMBOL_TABLE
+                                && visibility == Visibility::Default
                                 && (output_kind.is_shared_object()
                                     || (output_kind.is_dynamic_executable()
                                         && symbol_db.symbol_strength(undefined.symbol_id, groups)

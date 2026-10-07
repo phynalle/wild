@@ -14,6 +14,8 @@ fn encode_headers(
     tls_directory: (u32, u32),
     load_config: (u32, u32),
     iat_directory: (u32, u32),
+    export_directory: (u32, u32),
+    debug_directory: (u32, u32),
 ) -> Result {
     ensure!(
         outputs.len() <= 96,
@@ -34,7 +36,7 @@ fn encode_headers(
     put16(
         image,
         0x96,
-        2 | if args.large_address_aware { 0x20 } else { 0 },
+        2 | if args.large_address_aware { 0x20 } else { 0 } | if args.is_dll { 0x2000 } else { 0 },
     );
     let opt = 0x98;
     put16(image, opt, 0x20b);
@@ -103,9 +105,11 @@ fn encode_headers(
     put64(image, opt + 96, args.heap.1);
     put32(image, opt + 108, 16);
     for (i, (rva, size)) in [
+        (0, export_directory),
         (1, import_directory),
         (3, exception_directory),
         (5, relocation_directory),
+        (6, debug_directory),
         (9, tls_directory),
         (10, load_config),
         (12, iat_directory),
@@ -186,6 +190,7 @@ fn file_offset(outputs: &[OutputSection], base: u64, address: u64) -> Result<usi
 pub(super) fn write<O: OutputFileData>(
     output: &mut SizedOutput<O>,
     layout: &Layout<Coff>,
+    pdb: Option<&super::pdb::Pdb>,
 ) -> Result {
     let args = layout.args();
     let mut outputs = Vec::new();
@@ -419,11 +424,33 @@ pub(super) fn write<O: OutputFileData>(
         (0, 0)
     };
     let iat_directory = iat_range.map_or((0, 0), |(start, end)| (start, end - start));
-    let entry = layout
-        .resolved_entry_symbol_address()?
-        .context("Missing PE entry point")?
-        .checked_sub(args.image_base)
-        .context("PE entry point lies below image base")?;
+    let entry = if args.no_entry {
+        0
+    } else {
+        layout
+            .resolved_entry_symbol_address()?
+            .context("Missing PE entry point")?
+            .checked_sub(args.image_base)
+            .context("PE entry point lies below image base")?
+    };
+    let export_directory = outputs
+        .iter()
+        .find(|s| s.name == ".edata")
+        .map_or((0, 0), |s| (s.rva, s.size));
+    let debug_directory = if let Some(pdb) = pdb {
+        let address = named_address(layout, "__wild_debug_directory")
+            .context("Missing PE debug directory")?;
+        let offset = file_offset(&outputs, args.image_base, address)?;
+        ensure!(
+            image.get(offset..offset + 52).is_some(),
+            "Truncated PE CodeView directory"
+        );
+        put32(image, offset + 24, u32::try_from(offset + 28)?);
+        image[offset + 32..offset + 48].copy_from_slice(&pdb.guid);
+        (u32::try_from(address - args.image_base)?, 28)
+    } else {
+        (0, 0)
+    };
     let headers = layout
         .section_layouts
         .get(crate::output_section_id::FILE_HEADER)
@@ -456,6 +483,8 @@ pub(super) fn write<O: OutputFileData>(
         tls_directory,
         load_config,
         iat_directory,
+        export_directory,
+        debug_directory,
     )
 }
 

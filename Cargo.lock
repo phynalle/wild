@@ -814,6 +814,7 @@ dependencies = [
  "cc",
  "colored",
  "colosseum",
+ "crc32fast",
  "crossbeam-queue",
  "crossbeam-utils",
  "derive_more",

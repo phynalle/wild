@@ -294,6 +294,20 @@ impl<'data, F: FileSystem> FileLoader<'data, F> {
     pub(crate) fn file_system(&self) -> &F {
         self.file_system.as_ref()
     }
+
+    /// Records format-specific metadata inputs in the ordinary input lifetime and change check.
+    pub(crate) fn load_auxiliary(&mut self, path: &Path) -> Result<&'data [u8]> {
+        let filename = self.file_system.absolute_path(path)?;
+        let (data, _) = self.file_system.open_input(&filename, false)?;
+        let file = self.inputs_arena.alloc(InputFile {
+            original_filename: path.to_owned(),
+            filename,
+            modifiers: Default::default(),
+            data: Some(data),
+        });
+        self.loaded_files.push(file);
+        Ok(file.data())
+    }
     pub(crate) fn new(
         inputs_arena: &'data Arena<InputFile<F::Input>>,
         file_system: Arc<F>,

@@ -311,6 +311,14 @@ pub trait FileSystem: Send + Sync + 'static {
     /// Removes a file.
     fn remove_file(&self, path: &Path) -> Result<()>;
 
+    /// Remove an old output without rejecting a path that has not been created yet.
+    fn remove_output_if_exists(&self, path: &Path) -> Result {
+        if self.file_type(path).is_ok() {
+            self.remove_file(path)?;
+        }
+        Ok(())
+    }
+
     /// Rename an existing file to a new path.
     fn rename_file(&self, path: &Path, new_path: &Path) -> Result<()>;
 
@@ -327,6 +335,16 @@ pub trait FileSystem: Send + Sync + 'static {
 
     /// Writes a complete auxiliary output.
     fn write_auxiliary(&self, path: &Path, bytes: &[u8]) -> Result;
+
+    /// Writes a sized auxiliary output using the same replacement and buffering policy as an image.
+    fn write_auxiliary_output(
+        &self,
+        path: Arc<Path>,
+        options: OutputOptions,
+        bytes: &[u8],
+    ) -> Result {
+        self.write_output(path, options, bytes)
+    }
 }
 
 /// The normal host operating-system filesystem.
@@ -466,6 +484,14 @@ impl FileSystem for OsFileSystem {
 
     fn remove_file(&self, path: &Path) -> Result<()> {
         Ok(std::fs::remove_file(path)?)
+    }
+
+    fn remove_output_if_exists(&self, path: &Path) -> Result {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn rename_file(&self, path: &Path, new_path: &Path) -> Result<()> {
