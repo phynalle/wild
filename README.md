@@ -1,134 +1,70 @@
-# Wild linker
+# Wild: Personal Windows Development Fork
 
-![Wild logo - drawing of rusty chain links with vines](/images/wild.png)
+This is a fork of [Wild](https://github.com/wild-linker/wild), a linker focused on
+fast iterative development. I added Windows support for my own Rust/Cargo
+workflow, implementing only what I need to build and debug my projects.
+The original linker is the work of the upstream Wild project and its contributors;
+this is not an official upstream Windows release.
 
-Wild is a linker with the goal of being very fast for iterative development.
+> **Personal development use only. Do not use this fork for production builds.**
+> Working in my environment does not guarantee correct output or compatibility
+> with yours.
 
-The plan is to eventually make it incremental, however that isn't yet implemented. It is however
-already pretty fast even without incremental linking.
+## Implementation And Status
 
-### Documentation quick links
+The Windows implementation and optimization work was delegated entirely to AI
+through Codex, using **GPT-6.1 sol** and **GPT-6 astra**.
 
-* [Usage](USAGE.md)
-* [Frequently asked questions](FAQ.md)
-* [Linker script support](LINKER_SCRIPT_SUPPORT.md)
-* [Windows x64 support and bootstrap](WINDOWS_SUPPORT.md)
+I do not have the linker implementation expertise to independently judge the
+correctness of these changes. The practical status is: **it "just works" for my
+current usage.** Tests and local validation are not an independent correctness
+audit. This limitation concerns the additions in this fork, not upstream Wild.
 
-## Benchmarks
+The Windows subset targets stable Rust on `x86_64-pc-windows-msvc`, including
+EXEs, DLLs, proc-macros, and PDBs for Visual Studio debugging. It is not a complete
+`link.exe` replacement, and incremental linking is not implemented.
 
-The goal of Wild is to eventually be very fast via incremental linking. However, we also want to be
-as fast as we can be for non-incremental linking and for the initial link when incremental linking is enabled. See [BENCHMARKING.md](BENCHMARKING.md) for details on running benchmarks.
+## Performance
 
-We run benchmarks on a few different systems:
+In my own use case, measured median full-link times were lower than LLD by:
 
-* [Ryzen 9 9955HX (16 core, 32 thread)](benchmarks/ryzen-9955hx.md)
-* [2020 era Intel-based laptop with 4 cores and 8 threads](benchmarks/lemp9.md)
-* [Raspberry Pi 5](benchmarks/raspberrypi.md)
+- **About 41-43%** for EXE links without PDB generation.
+- **About 10-17%** for EXE links with PDB generation.
 
-For example, linking Chromium with CREL relocations on the Ryzen system:
+These are results from my tested workloads, not a general performance guarantee
+or a reduction in total Cargo build time.
 
-![Benchmark of linking chrome-crel](benchmarks/images/ryzen-9955hx/chrome-crel-time.svg)
+Speed takes priority over memory; the tested workloads used more memory than LLD.
+Faster linking does not speed up Rust compilation or improve the whole Cargo
+build by the same amount. DLL speedups are not claimed.
 
-## Feature support
+## Build And Use
 
-The following platforms / architectures are currently supported:
+Build this checkout with stable Rust, MSVC x64 tools, and a Windows SDK installed:
 
-* x86-64 on Linux
-* AArch64 (ARM64) on Linux
-* RISC-V (riscv64gc) on Linux
-* LoongArch64 on Linux
-* PPC64LE on Linux (initial support)
-* x86-64 on Windows (initial COFF/PE executable support; see [Windows support](WINDOWS_SUPPORT.md))
-
-Here are some of the bigger things we're looking ahead to:
-
-* Incremental linking
-* Mach-O support
-* WebAssembly support
-* Extended Windows support (DLLs, PDBs and broader MSVC compatibility)
-
-## Installation
-
-### From GitHub releases
-
-Download a tarball from the [releases page](https://github.com/wild-linker/wild/releases). Unpack
-it and copy the `wild` binary somewhere on your path.
-
-### Cargo binstall
-
-If you have [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), you can install wild as
-follows:
-
-```sh
-cargo binstall wild-linker
+```powershell
+cargo +stable build -p wild-linker --release --locked
 ```
 
-### Brew
+The executable is `target/release/wild.exe`. To try it in a Cargo project, set
+the absolute path to this binary:
 
-```sh
-brew install wild-linker/wild/wild
+```toml
+[target.x86_64-pc-windows-msvc]
+linker = "C:/path/to/this/fork/target/release/wild.exe"
 ```
 
-### Build latest release from crates.io
+Try it in a separate configuration and keep your normal linker available.
+Upstream releases do not include this fork's changes.
 
-```sh
-cargo install --locked wild-linker
-```
-
-### Build from git head
-
-To build and install the latest, unreleased code:
-
-```sh
-cargo install --locked --bin wild --git https://github.com/wild-linker/wild.git wild-linker
-```
-
-### Nix
-
-To use a stable Wild from Nixpkgs:
-
-```nix
-let
- wildStdenv = pkgs.useWildLinker pkgs.stdenv;
-in
-pkgs.callPackage ./package { stdenv = wildStdenv; }
-```
-
-to use the latest unstable git revision of wild, see [the nix documentation](./nix/nix.md).
-
-## Contributing
-
-For more information on contributing to Wild, see [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## Chat server
-
-We have a Zulip server for Wild-related chat. You can join
-[here](https://wild.zulipchat.com/join/bbopdeg6howwjpaiyowngyde/).
-
-## Further reading
-
-Many of the posts on [David's blog](https://davidlattimore.github.io/) are about various aspects of
-the Wild linker.
-
-## Sponsorship
-
-If you'd like to [sponsor this work](https://github.com/sponsors/davidlattimore), that would be very
-much appreciated. The more sponsorship I get the longer I can continue to work on this project full
-time.
-
-Also, the Wild project is supported by the Rust Foundation's Rust Innovation Lab: https://rustfoundation.org/media/welcoming-wild-to-the-rust-innovation-lab/
-
-## Code of Conduct
-
-The Wild project adheres to the [Rust code of
-conduct](https://rust-lang.org/policies/code-of-conduct/). If you have any moderation concerns or
-queries, please email wild-mod@googlegroups.com.
+See [Windows support](WINDOWS_SUPPORT.md) for limitations and
+[Windows Rust development](docs/windows-rust-development.md) for debugging setup.
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT)
-at your option.
+Licensed under either [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT), at your option.
 
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
-Wild by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
-additional terms or conditions.
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in Wild by you, as defined in the Apache-2.0 license, shall be dual
+licensed as above, without any additional terms or conditions.
