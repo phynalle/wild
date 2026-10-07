@@ -134,6 +134,7 @@ use crate::layout::{FileLayout, Layout, ObjectLayout};
 use crate::platform::{ObjectFile as _, RelocationSequence as _, Symbol as _};
 use crate::symbol::UnversionedSymbolName;
 use crate::{OutputFileData, bail, ensure};
+use rayon::prelude::*;
 
 struct OutputSection {
     id: crate::output_section_id::OutputSectionId,
@@ -231,6 +232,7 @@ pub(super) fn write<O: OutputFileData>(
     let mut descriptors = Vec::new();
     let mut iat_range: Option<(u32, u32)> = None;
     let copy_and_relocate = crate::timing_guard!("PE copy and relocate");
+    let mut jobs = Vec::new();
     for group in &layout.group_layouts {
         for file in &group.files {
             let FileLayout::Object(object) = file else {
@@ -254,25 +256,7 @@ pub(super) fn write<O: OutputFileData>(
                     .checked_add(section.size as usize)
                     .context("PE section size overflow")?;
                 ensure!(end <= image.len(), "PE section exceeds output");
-                object
-                    .object
-                    .copy_section_data(section, &mut image[start..end])?;
-                relocate(
-                    layout,
-                    object,
-                    index,
-                    address,
-                    &outputs,
-                    &mut image[start..end],
-                    &mut base_relocations,
-                )
-                .with_context(|| {
-                    format!(
-                        "Relocating {} {}",
-                        object.input,
-                        object.object.section_display_name(index)
-                    )
-                })?;
+                jobs.push((jobs.len(), object, index, address, start, end));
                 if object.object.section_name(index)? == b".idata$2" {
                     descriptors.push((u32::try_from(address - args.image_base)?, section.size));
                 }
@@ -285,6 +269,61 @@ pub(super) fn write<O: OutputFileData>(
                 }
             }
         }
+    }
+    jobs.sort_unstable_by_key(|job| job.4);
+    let mut remaining = &mut image[..];
+    let mut offset = 0;
+    let mut regions = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        ensure!(job.4 >= offset, "Overlapping PE output allocations");
+        let (_, tail) = remaining.split_at_mut(job.4 - offset);
+        let (bytes, tail) = tail.split_at_mut(job.5 - job.4);
+        remaining = tail;
+        offset = job.5;
+        regions.push((job, bytes));
+    }
+    let results: Vec<_> = regions
+        .par_chunks_mut(256)
+        .map(|chunk| {
+            let mut relocations = Vec::new();
+            let mut errors = Vec::new();
+            for (job, bytes) in chunk {
+                let (order, object, index, address, _, _) = *job;
+                let result = (|| {
+                    let section = object.object.section(index)?;
+                    object.object.copy_section_data(section, bytes)?;
+                    relocate(
+                        layout,
+                        object,
+                        index,
+                        address,
+                        &outputs,
+                        bytes,
+                        &mut relocations,
+                    )
+                })()
+                .with_context(|| {
+                    format!(
+                        "Relocating {} {}",
+                        object.input,
+                        object.object.section_display_name(index)
+                    )
+                });
+                if let Err(error) = result {
+                    errors.push((order, error));
+                }
+            }
+            (relocations, errors)
+        })
+        .collect();
+    drop(regions);
+    let mut errors = Vec::new();
+    for (relocations, chunk_errors) in results {
+        base_relocations.extend(relocations);
+        errors.extend(chunk_errors);
+    }
+    if let Some((_, error)) = errors.into_iter().min_by_key(|(order, _)| *order) {
+        return Err(error);
     }
     drop(copy_and_relocate);
     let _directories_and_headers = crate::timing_guard!("PE directories and headers");

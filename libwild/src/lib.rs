@@ -105,6 +105,68 @@ mod common_pipeline_tests {
         assert_eq!(file.entry(), text.address());
         assert_eq!(text.data().unwrap()[0], 0xc3);
     }
+
+    #[test]
+    fn sparse_elf_archive_selection_is_thread_deterministic() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("inputs.a");
+        let mut archive = ar::Builder::new(Vec::new());
+        for index in 0..513 {
+            let mut object = object::write::Object::new(
+                object::BinaryFormat::Elf,
+                object::Architecture::X86_64,
+                object::Endianness::Little,
+            );
+            let section =
+                object.add_section(Vec::new(), b".text".to_vec(), object::SectionKind::Text);
+            object.append_section_data(section, &[if index == 512 { 0xc3 } else { 0xcc }], 16);
+            object.add_symbol(object::write::Symbol {
+                name: if index == 512 {
+                    b"_start".to_vec()
+                } else {
+                    b"unused".to_vec()
+                },
+                value: 0,
+                size: 1,
+                kind: object::SymbolKind::Text,
+                scope: object::SymbolScope::Linkage,
+                weak: false,
+                section: object::write::SymbolSection::Section(section),
+                flags: object::SymbolFlags::None,
+            });
+            let bytes = object.write().unwrap();
+            archive
+                .append(
+                    &ar::Header::new(format!("{index}.o").into_bytes(), bytes.len() as u64),
+                    &*bytes,
+                )
+                .unwrap();
+        }
+        std::fs::write(&input, archive.into_inner().unwrap()).unwrap();
+        let mut reference = None;
+        for threads in [1, 2, 4] {
+            let output = temp.path().join("image.elf");
+            let mut args = crate::args::elf::ElfArgs::default();
+            args.common.num_threads = std::num::NonZeroUsize::new(threads);
+            args.common.output = std::sync::Arc::from(output.as_path());
+            args.common.inputs.push(crate::args::Input {
+                spec: crate::args::InputSpec::File(input.clone().into()),
+                modifiers: Default::default(),
+                search_first: None,
+            });
+            crate::run(crate::Args::Elf(args)).unwrap();
+            let bytes = std::fs::read(output).unwrap();
+            let file = object::File::parse(&*bytes).unwrap();
+            assert_eq!(
+                file.section_by_name(".text").unwrap().data().unwrap()[0],
+                0xc3
+            );
+            if let Some(previous) = &reference {
+                assert_eq!(previous, &bytes);
+            }
+            reference = Some(bytes);
+        }
+    }
 }
 pub(crate) mod timing;
 pub(crate) use timing::timing_guard;
@@ -176,6 +238,32 @@ pub fn run(mut args: Args) -> error::Result {
     Ok(())
 }
 
+/// Runs one link and terminates the process, letting the OS reclaim successful link allocations.
+/// Output completion and input verification happen before returning jobserver tokens and exiting.
+pub fn run_and_exit(mut args: Args) -> ! {
+    let result = (|| -> error::Result {
+        let thread_pool = args.common_mut().build_thread_pool()?;
+        thread_pool.pool.install(|| -> error::Result {
+            let linker = Linker::new();
+            let output = linker.run(&args)?;
+            drop(linker.shutdown_scope.take());
+            drop(linker._link_scope.take());
+            timing::finalise_perfetto_trace()?;
+            std::io::stdout().flush()?;
+            std::io::stderr().flush()?;
+            std::mem::forget(output);
+            std::mem::forget(linker);
+            Ok(())
+        })?;
+        drop(thread_pool);
+        Ok(())
+    })();
+    if let Err(error) = result {
+        error::report_error_and_exit(&error);
+    }
+    std::process::exit(0)
+}
+
 /// Sets up whatever tracing, if any, is indicated by the supplied arguments. This can only be
 /// called once and only if nothing else has already set the global tracing dispatcher. Calling this
 /// is optional. If it isn't called, no tracing-based features will function. e.g. --time.
@@ -216,7 +304,7 @@ pub struct Linker<F: FileSystem = OsFileSystem> {
 
     /// A timing scope that exists for the whole time we're linking.
     #[allow(dyn_drop)]
-    _link_scope: Vec<Box<dyn Drop>>,
+    _link_scope: AtomicCell<Vec<Box<dyn Drop>>>,
 
     // File system used for reading of the inputs and writing of the output file(s).
     file_system: std::sync::Arc<F>,
@@ -251,7 +339,11 @@ impl<F: FileSystem> Linker<F> {
             linker_plugin_arena: Arena::new(),
             herd: Default::default(),
             shutdown_scope: Default::default(),
-            _link_scope: vec![Box::new(guard_a), Box::new(guard_b), Box::new(thread_guard)],
+            _link_scope: AtomicCell::new(vec![
+                Box::new(guard_a),
+                Box::new(guard_b),
+                Box::new(thread_guard),
+            ]),
         }
     }
 

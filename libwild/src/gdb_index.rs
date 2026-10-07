@@ -236,7 +236,7 @@ pub(crate) fn compute_gdb_index_size<'data, C: ElfClass>(
             let FileLayoutState::Object(obj) = f else {
                 return None;
             };
-            Some((obj, obj.sections.as_slice()))
+            Some((obj.as_ref(), obj.sections.as_slice()))
         })
         .collect();
     let scan = scan_objects_for_gdb_index(&objects)?;

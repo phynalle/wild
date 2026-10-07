@@ -211,6 +211,174 @@ fn imported_thunk_points_at_the_start_of_its_iat_slot() {
 }
 
 #[test]
+fn short_import_names_borrow_validated_input() {
+    let payload = b"imported\0example.dll\0";
+    let mut bytes = vec![0; 20];
+    bytes[..4].copy_from_slice(&[0, 0, 0xff, 0xff]);
+    bytes[6..8].copy_from_slice(&0x8664u16.to_le_bytes());
+    bytes[12..16].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    bytes[18..20].copy_from_slice(&4u16.to_le_bytes());
+    bytes.extend_from_slice(payload);
+    let input::Parsed::Import(import) = input::parse(&bytes, "import.obj".into()).unwrap() else {
+        panic!("Expected an import");
+    };
+    for name in [import.symbol, import.dll, import.name.unwrap()] {
+        let start = name.as_ptr() as usize - bytes.as_ptr() as usize;
+        assert!(start <= bytes.len() && name.len() <= bytes.len() - start);
+    }
+    for end in 0..bytes.len() {
+        assert!(input::parse(&bytes[..end], "truncated.obj".into()).is_err());
+    }
+    let image = link_objects(&[caller("imported"), archive(&[bytes])], |_| {}).unwrap();
+    assert!(object::read::pe::PeFile64::parse(&*image).is_ok());
+}
+
+fn short_import(symbol: &str, dll: &str) -> Vec<u8> {
+    let payload = format!("{symbol}\0{dll}\0");
+    let mut bytes = vec![0; 20];
+    bytes[..4].copy_from_slice(&[0, 0, 0xff, 0xff]);
+    bytes[6..8].copy_from_slice(&0x8664u16.to_le_bytes());
+    bytes[12..16].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    bytes[18..20].copy_from_slice(&4u16.to_le_bytes());
+    bytes.extend_from_slice(payload.as_bytes());
+    bytes
+}
+
+#[test]
+fn optional_import_coalescing_preserves_order_overrides_and_wholearchive() {
+    let first = short_import("imported", "first.dll");
+    let other = short_import("imported", "other.dll");
+    let repeated = [
+        caller("imported"),
+        archive(&vec![first.clone(); 64]),
+        archive(&[other.clone(), first.clone()]),
+        archive(&[first.clone()]),
+    ];
+    let expected = link_objects(&[caller("imported"), archive(&[first.clone()])], |_| {}).unwrap();
+    for threads in [1, 2, 16] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let image = pool.install(|| link_objects(&repeated, |_| {})).unwrap();
+        assert_eq!(expected, image);
+    }
+    let reordered = link_objects(
+        &[
+            caller("imported"),
+            archive(&[other.clone()]),
+            archive(&[first.clone()]),
+        ],
+        |_| {},
+    )
+    .unwrap();
+    let expected_other = link_objects(&[caller("imported"), archive(&[other])], |_| {}).unwrap();
+    assert_eq!(expected_other, reordered);
+    assert_ne!(expected, reordered);
+
+    let strong = object("imported", &[0xc3], None);
+    let mut overridden = repeated.to_vec();
+    overridden.push(strong.clone());
+    let overridden = link_objects(&overridden, |_| {}).unwrap();
+    let expected_strong = link_objects(&[caller("imported"), strong], |_| {}).unwrap();
+    assert_eq!(expected_strong, overridden);
+
+    // An unreferenced mandatory copy must activate even if an identical optional copy came first.
+    let mandatory = link_objects(
+        &[
+            object("entry", &[0xc3], None),
+            archive(&[first.clone()]),
+            archive(&[first]),
+        ],
+        |args| {
+            args.common
+                .inputs
+                .last_mut()
+                .unwrap()
+                .modifiers
+                .whole_archive = true
+        },
+    )
+    .unwrap();
+    let pe = object::read::pe::PeFile64::parse(&*mandatory).unwrap();
+    assert_ne!(
+        pe.data_directory(object::pe::IMAGE_DIRECTORY_ENTRY_IMPORT)
+            .unwrap()
+            .virtual_address
+            .get(object::LittleEndian),
+        0
+    );
+}
+
+#[test]
+fn sharded_comdat_selection_preserves_output_and_first_error() {
+    let mut padding = Object::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
+    for _ in 0..4096 {
+        padding.add_section(Vec::new(), b".rdata".to_vec(), SectionKind::ReadOnlyData);
+    }
+    let padding = padding.write().unwrap();
+    let first = "first";
+    let second = (0..100)
+        .map(|i| format!("other{i}"))
+        .find(|name| {
+            crate::hash::hash_bytes(name.as_bytes()) & 1
+                != crate::hash::hash_bytes(first.as_bytes()) & 1
+        })
+        .unwrap();
+    let valid = [
+        padding.clone(),
+        object("entry", &[0xc3], Some(ComdatKind::Any)),
+        object(&second, &[0x90, 0xc3], Some(ComdatKind::Any)),
+        object(&second, &[0xcc], Some(ComdatKind::Any)),
+        object("entry", &[0xcc], Some(ComdatKind::Any)),
+    ];
+    let invalid = [
+        padding,
+        object("entry", &[0xc3], None),
+        object(first, &[0xc3], Some(ComdatKind::NoDuplicates)),
+        object(&second, &[0xc3], Some(ComdatKind::NoDuplicates)),
+        object(&second, &[0xc3], Some(ComdatKind::NoDuplicates)),
+        object(first, &[0xc3], Some(ComdatKind::NoDuplicates)),
+    ];
+    let mut previous_image = None;
+    let mut previous_error = None;
+    for threads in [1, 2, 16] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let image = pool
+            .install(|| {
+                link_objects(&valid, |args| {
+                    args.common.available_threads = std::num::NonZeroUsize::new(threads).unwrap();
+                    args.directives.push(format!("/INCLUDE:{second}"));
+                })
+            })
+            .unwrap();
+        if let Some(previous) = &previous_image {
+            assert_eq!(previous, &image);
+        }
+        previous_image = Some(image);
+        let error = pool
+            .install(|| {
+                link_objects(&invalid, |args| {
+                    args.common.available_threads = std::num::NonZeroUsize::new(threads).unwrap();
+                })
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("NODUPLICATES") && error.contains(&second),
+            "{error}"
+        );
+        if let Some(previous) = &previous_error {
+            assert_eq!(previous, &error);
+        }
+        previous_error = Some(error);
+    }
+}
+
+#[test]
 fn subsection_order_preserves_input_order_across_alignments() {
     let mut objects = vec![object("entry", &[0xc3], None)];
     for (name, value, alignment) in [
@@ -1261,7 +1429,7 @@ fn archive_index_order_does_not_change_member_precedence() {
 #[test]
 fn thread_options_set_shared_pool_configuration() {
     let mut args = CoffArgs::default();
-    assert_eq!(args.common.default_thread_cap.get(), 8);
+    assert_eq!(args.common.default_thread_cap.get(), 16);
     crate::args::coff::parse(&mut args, ["/THREADS:2"].into_iter()).unwrap();
     assert_eq!(args.common.num_threads.unwrap().get(), 2);
     crate::args::coff::parse(&mut args, ["/NO-THREADS"].into_iter()).unwrap();
@@ -1407,4 +1575,41 @@ fn nested_associative_comdats_follow_the_parent_chain() {
         &pe.section_by_name(".rdata").unwrap().data().unwrap()[..2],
         &[0x44, 0x44]
     );
+}
+
+#[test]
+fn deferred_archive_body_is_validated_only_when_selected() {
+    let mut invalid = pointer_object("unused", "entry", 1);
+    let file =
+        object::read::coff::CoffFile::<_, object::pe::ImageFileHeader>::parse(&*invalid).unwrap();
+    let relocation = &file.sections().next().unwrap().coff_relocations().unwrap()[0];
+    let offset =
+        std::ptr::addr_of!(relocation.symbol_table_index) as usize - invalid.as_ptr() as usize;
+    invalid[offset..offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    let library = indexed_archive(&[invalid], &[("unused", 0)]);
+    assert!(link_objects(&[object("entry", &[0xc3], None), library.clone()], |_| {}).is_ok());
+    let error = link_objects(&[caller("unused"), library], |_| {}).unwrap_err();
+    assert!(error.to_string().contains("Invalid relocation symbol"));
+}
+
+#[test]
+fn archive_catalog_preserves_raw_symbol_indices_and_cached_hashes() {
+    let bytes = pointer_object("needed", "entry", 1);
+    let catalog = input::catalog(&bytes, "member.obj").unwrap().unwrap();
+    let input::Parsed::Object(full) = input::parse(&bytes, "member.obj".into()).unwrap() else {
+        panic!("Expected object");
+    };
+    assert_eq!(catalog.symbols.len(), full.symbols.len());
+    for (index, symbol) in catalog.symbols.iter().enumerate() {
+        if symbol.name.is_empty() {
+            continue;
+        }
+        let expected = full.symbols[index];
+        assert_eq!(symbol.name.range(), expected.name.range());
+        assert_eq!(
+            symbol.name_hash,
+            crate::hash::hash_bytes(&bytes[symbol.name.range()])
+        );
+        assert_eq!(symbol.name_hash, expected.name_hash);
+    }
 }

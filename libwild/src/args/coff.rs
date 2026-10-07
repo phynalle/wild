@@ -9,8 +9,8 @@ use crate::platform::Args as _;
 use std::path::Path;
 use std::sync::Arc;
 
-// Full-link benchmarks favor eight workers over the host's logical CPU count.
-const DEFAULT_THREAD_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::new(8).unwrap();
+// Bound automatic parallelism while retaining the explicit options and jobserver budget.
+const DEFAULT_THREAD_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::new(16).unwrap();
 
 /// The only machine type we currently support.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

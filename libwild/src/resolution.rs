@@ -39,6 +39,7 @@ use crate::platform::DynamicTagValues as _;
 use crate::platform::FrameIndex;
 use crate::platform::ObjectFile;
 use crate::platform::Platform;
+use crate::platform::RawSymbolName as _;
 use crate::platform::SectionHeader as _;
 use crate::platform::Symbol as _;
 use crate::string_merging::StringMergeSectionExtra;
@@ -58,7 +59,6 @@ use crate::value_flags::PerSymbolFlags;
 use crate::value_flags::ValueFlags;
 use crate::verbose_timing_phase;
 use atomic_take::AtomicTake;
-use crossbeam_queue::ArrayQueue;
 use crossbeam_queue::SegQueue;
 use object::SectionIndex;
 use rayon::Scope;
@@ -76,6 +76,7 @@ use std::sync::atomic::Ordering;
 pub(crate) struct Resolver<'data, P: Platform> {
     undefined_symbols: Vec<UndefinedSymbol<'data>>,
     pub(crate) resolved_groups: Vec<ResolvedGroup<'data, P>>,
+    pub(crate) activated_files: Vec<FileId>,
     requested_files: std::collections::BTreeSet<FileId>,
 }
 
@@ -143,7 +144,7 @@ impl<'data, P: Platform> Resolver<'data, P> {
         );
 
         self.resolved_groups.push(ResolvedGroup {
-            files: vec![ResolvedFile::SyntheticSymbols(syn)],
+            files: vec![ResolvedFile::SyntheticSymbols(Box::new(syn))],
         });
 
         Ok(self.resolved_groups)
@@ -156,6 +157,7 @@ fn resolve_symbols_and_select_archive_entries<'data, P: Platform>(
     per_symbol_flags: &mut PerSymbolFlags,
 ) -> Result {
     timing_phase!("Resolve symbols");
+    resolver.activated_files.clear();
 
     // Note, this is the total number of objects including those that we might have processed in
     // previous calls. This is just an upper bound on how many objects might need to be loaded. We
@@ -291,6 +293,7 @@ fn resolve_symbols_and_select_archive_entries<'data, P: Platform>(
             ResolvedFile::Dynamic(o) => o.common.file_id,
             _ => unreachable!(),
         };
+        resolver.activated_files.push(file_id);
         resolver.resolved_groups[file_id.group()].files[file_id.file()] = obj;
     }
 
@@ -302,6 +305,8 @@ fn resolve_symbols_and_select_archive_entries<'data, P: Platform>(
     }
 
     resolver.undefined_symbols.extend(outputs.undefined_symbols);
+    resolver.activated_files.sort_unstable();
+    tracing::debug!(target: "metrics", activated_objects = resolver.activated_files.len(), total_objects = num_regular_objects, unresolved_records = resolver.undefined_symbols.len(), "resolver_wave");
 
     Ok(())
 }
@@ -327,6 +332,7 @@ fn resolve_group<'data, 'definitions, P: Platform>(
                 definitions_out,
                 symbol_db,
                 outputs,
+                None,
                 |work_item| {
                     initial_work_out.push(work_item);
                 },
@@ -335,9 +341,9 @@ fn resolve_group<'data, 'definitions, P: Platform>(
             definitions_out_per_file.push(AtomicTake::empty());
 
             ResolvedGroup {
-                files: vec![ResolvedFile::Prelude(ResolvedPrelude {
+                files: vec![ResolvedFile::Prelude(Box::new(ResolvedPrelude {
                     symbol_definitions: prelude.symbol_definitions.clone(),
-                })],
+                }))],
             }
         }
         Group::Objects(parsed_input_objects) => {
@@ -358,6 +364,7 @@ fn resolve_group<'data, 'definitions, P: Platform>(
                             definitions_out,
                             symbol_db,
                             outputs,
+                            None,
                             |work_item| {
                                 initial_work_out.push(work_item);
                             },
@@ -382,13 +389,13 @@ fn resolve_group<'data, 'definitions, P: Platform>(
                         .split_off_mut(..stub.symbol_id_range.len())
                         .unwrap();
                     definitions_out_per_file.push(AtomicTake::empty());
-                    ResolvedFile::StubLibrary(ResolvedStubLibrary {
+                    ResolvedFile::StubLibrary(Box::new(ResolvedStubLibrary {
                         input: stub.input,
                         file_id: stub.file_id,
                         symbol_id_range: stub.symbol_id_range,
                         // TODO: Consider alternative to cloning this.
                         defined_symbols: stub.defined_symbols.clone(),
-                    })
+                    }))
                 })
                 .collect();
 
@@ -410,13 +417,13 @@ fn resolve_group<'data, 'definitions, P: Platform>(
                         definitions_out,
                     });
 
-                    ResolvedFile::LinkerScript(ResolvedLinkerScript {
+                    ResolvedFile::LinkerScript(Box::new(ResolvedLinkerScript {
                         input: s.parsed.input,
                         file_id: s.file_id,
                         symbol_id_range: s.symbol_id_range,
                         // TODO: Consider alternative to cloning this.
                         symbol_definitions: s.parsed.symbol_defs.clone(),
-                    })
+                    }))
                 })
                 .collect();
 
@@ -430,12 +437,14 @@ fn resolve_group<'data, 'definitions, P: Platform>(
             definitions_out_per_file.push(AtomicTake::empty());
 
             ResolvedGroup {
-                files: vec![ResolvedFile::SyntheticSymbols(ResolvedSyntheticSymbols {
-                    file_id: syn.file_id,
-                    start_symbol_id: syn.symbol_id_range.start(),
-                    symbol_definitions: Vec::new(),
-                    start_stop_sections: None,
-                })],
+                files: vec![ResolvedFile::SyntheticSymbols(Box::new(
+                    ResolvedSyntheticSymbols {
+                        file_id: syn.file_id,
+                        start_symbol_id: syn.symbol_id_range.start(),
+                        symbol_definitions: Vec::new(),
+                        start_stop_sections: None,
+                    },
+                ))],
             }
         }
         #[cfg(feature = "plugins")]
@@ -455,6 +464,7 @@ fn resolve_group<'data, 'definitions, P: Platform>(
                             definitions_out,
                             symbol_db,
                             outputs,
+                            None,
                             |work_item| {
                                 initial_work_out.push(work_item);
                             },
@@ -637,6 +647,7 @@ impl<'scope, 'data, P: Platform> ResolutionResources<'data, 'scope, P> {
             definitions_out,
             self.symbol_db,
             self.outputs,
+            Some(self.per_symbol_flags),
             |work_item| {
                 scope.spawn(|scope| {
                     process_object(work_item, self, scope);
@@ -647,7 +658,7 @@ impl<'scope, 'data, P: Platform> ResolutionResources<'data, 'scope, P> {
 
     fn handle_result(&self, result: Result) {
         if let Err(error) = result {
-            let _ = self.outputs.errors.push(error);
+            self.outputs.errors.push(error);
         }
     }
 }
@@ -657,34 +668,63 @@ fn work_items_do<'definitions, 'data, P: Platform>(
     mut definitions_out: &'definitions mut [SymbolId],
     symbol_db: &SymbolDb<'data, P>,
     outputs: &Outputs<'data, P>,
+    flags: Option<&AtomicPerSymbolFlags<'_>>,
     mut request_callback: impl FnMut(LoadObjectSymbolsRequest<'definitions>),
 ) {
     match &symbol_db.groups[file_id.group()] {
         Group::Objects(parsed_input_objects) => {
             let obj = &parsed_input_objects[file_id.file()];
+            match obj.parsed.object.materialize() {
+                Ok(true) => {
+                    for ((index, symbol), definition) in obj
+                        .parsed
+                        .object
+                        .enumerate_symbols()
+                        .zip(&mut *definitions_out)
+                    {
+                        let id = obj.symbol_id_range.input_to_id(index);
+                        *definition = if symbol.is_undefined() {
+                            SymbolId::undefined()
+                        } else {
+                            id
+                        };
+                        if let Some(flags) = flags {
+                            flags
+                                .get_atomic(id)
+                                .or_assign(symbol_db.initial_symbol_flags(obj, symbol));
+                        }
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    outputs.errors.push(
+                        Err::<(), _>(error)
+                            .with_context(|| format!("Failed to materialize {}", obj.parsed.input))
+                            .unwrap_err(),
+                    );
+                    return;
+                }
+            }
             let common = ResolvedCommon::new(obj);
-            let resolved_object =
-                if let Some(dynamic_tag_values) = obj.parsed.object.dynamic_tag_values() {
-                    ResolvedFile::Dynamic(ResolvedDynamic::new(common, dynamic_tag_values))
-                } else {
-                    ResolvedFile::Object(ResolvedObject::new(common, obj.section_id_range))
-                };
-            // Push won't fail because we allocated enough space for all the objects.
-            outputs.loaded.push(resolved_object).unwrap();
+            let resolved_object = if let Some(dynamic_tag_values) =
+                obj.parsed.object.dynamic_tag_values()
+            {
+                ResolvedFile::Dynamic(Box::new(ResolvedDynamic::new(common, dynamic_tag_values)))
+            } else {
+                ResolvedFile::Object(Box::new(ResolvedObject::new(common, obj.section_id_range)))
+            };
+            outputs.loaded.push(resolved_object);
         }
         Group::StubLibraries(_) => {}
         #[cfg(feature = "plugins")]
         Group::LtoInputs(lto_objects) => {
             let obj = &lto_objects[file_id.file()];
             // Push won't fail because we allocated enough space for all the LTO objects.
-            outputs
-                .loaded_lto_objects
-                .push(ResolvedLtoInput {
-                    file_id: obj.file_id,
-                    symbol_id_range: obj.symbol_id_range,
-                    section_id_range: obj.section_id_range,
-                })
-                .unwrap();
+            outputs.loaded_lto_objects.push(ResolvedLtoInput {
+                file_id: obj.file_id,
+                symbol_id_range: obj.symbol_id_range,
+                section_id_range: obj.section_id_range,
+            });
 
             request_callback(LoadObjectSymbolsRequest {
                 file_id,
@@ -726,14 +766,15 @@ pub(crate) struct ResolvedGroup<'data, P: Platform> {
 }
 
 #[derive(Debug)]
+// Most archive members stay unloaded; allocate full states only for selected inputs.
 pub(crate) enum ResolvedFile<'data, P: Platform> {
     NotLoaded(NotLoaded),
-    Prelude(ResolvedPrelude<'data, P>),
-    Object(ResolvedObject<'data, P>),
-    Dynamic(ResolvedDynamic<'data, P>),
-    StubLibrary(ResolvedStubLibrary<'data>),
-    LinkerScript(ResolvedLinkerScript<'data, P>),
-    SyntheticSymbols(ResolvedSyntheticSymbols<'data, P>),
+    Prelude(Box<ResolvedPrelude<'data, P>>),
+    Object(Box<ResolvedObject<'data, P>>),
+    Dynamic(Box<ResolvedDynamic<'data, P>>),
+    StubLibrary(Box<ResolvedStubLibrary<'data>>),
+    LinkerScript(Box<ResolvedLinkerScript<'data, P>>),
+    SyntheticSymbols(Box<ResolvedSyntheticSymbols<'data, P>>),
     #[cfg(feature = "plugins")]
     LtoInput(ResolvedLtoInput),
 }
@@ -1135,13 +1176,13 @@ fn is_partial_link_singleton_candidate<P: Platform>(
 
 struct Outputs<'data, P: Platform> {
     /// Where we put objects once we've loaded them.
-    loaded: ArrayQueue<ResolvedFile<'data, P>>,
+    loaded: SegQueue<ResolvedFile<'data, P>>,
 
     #[cfg(feature = "plugins")]
-    loaded_lto_objects: ArrayQueue<ResolvedLtoInput>,
+    loaded_lto_objects: SegQueue<ResolvedLtoInput>,
 
     /// Any errors that we encountered.
-    errors: ArrayQueue<Error>,
+    errors: SegQueue<Error>,
 
     undefined_symbols: SegQueue<UndefinedSymbol<'data>>,
 }
@@ -1150,10 +1191,10 @@ impl<'data, P: Platform> Outputs<'data, P> {
     #[allow(unused_variables)]
     fn new(num_regular_objects: usize, num_lto_objects: usize) -> Self {
         Self {
-            loaded: ArrayQueue::new(num_regular_objects.max(1)),
+            loaded: SegQueue::new(),
             #[cfg(feature = "plugins")]
-            loaded_lto_objects: ArrayQueue::new(num_lto_objects.max(1)),
-            errors: ArrayQueue::new(1),
+            loaded_lto_objects: SegQueue::new(),
+            errors: SegQueue::new(),
             undefined_symbols: SegQueue::new(),
         }
     }
@@ -1836,7 +1877,8 @@ fn resolve_symbols<'data, 'scope, P: Platform>(
                     name_bytes,
                     &verneed_table,
                     object::SymbolIndex(local_symbol_index),
-                );
+                )
+                .with_name_hash(obj.parsed.object.symbol_name_hash(local_symbol));
 
                 let symbol_attributes = SymbolAttributes {
                     name_info,
@@ -2084,6 +2126,7 @@ impl<'data, P: Platform> Default for Resolver<'data, P> {
         Self {
             undefined_symbols: Default::default(),
             resolved_groups: Default::default(),
+            activated_files: Default::default(),
             requested_files: Default::default(),
         }
     }

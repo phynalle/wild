@@ -74,7 +74,10 @@ impl<'data> PreHashedSymbolName<'data> {
     pub(crate) fn from_raw(
         name_info: &impl platform::RawSymbolName<'data>,
     ) -> PreHashedSymbolName<'data> {
-        let name = UnversionedSymbolName::prehashed(name_info.name());
+        let name = PreHashed::new(
+            UnversionedSymbolName::new(name_info.name()),
+            name_info.name_hash(),
+        );
         if let Some(version) = name_info.version_name() {
             PreHashedSymbolName::Versioned(VersionedSymbolName::prehashed(name, version))
         } else {

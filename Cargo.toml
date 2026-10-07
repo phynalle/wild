@@ -166,6 +166,7 @@ zstd = { version = "0.14.0", default-features = false }
 
 [profile.release]
 codegen-units = 1
+lto = "thin"
 
 [profile.release-debug]
 inherits = "release"
@@ -175,6 +176,7 @@ debug = true
 [profile.opt]
 inherits = "release"
 codegen-units = 16
+lto = false
 
 [profile.opt-debug]
 inherits = "opt"

@@ -141,22 +141,18 @@ pub(crate) fn create_groups<'data, P: Platform>(
     let mut objects = parsed_objects.into_iter().peekable();
 
     let mut num_symbols_in_group = 0;
-    let mut group_objects = Vec::new();
+    let mut group_objects = Vec::with_capacity(max_files_per_group.min(objects.len()));
 
     let allocator = symbol_db.herd.get();
 
     while let Some(parsed) = objects.next() {
         let file_id = FileId::new(symbol_db.next_group_index(), group_objects.len() as u32);
         let num_symbols_in_file = parsed.object.num_symbols();
-
         let section_count = if parsed.object.is_dynamic() {
-            // We don't copy sections from dynamic objects into the output, so for our purposes,
-            // there are no sections.
             0
         } else {
             parsed.object.num_sections()
         };
-
         group_objects.push(SequencedInputObject {
             parsed,
             symbol_id_range: SymbolIdRange::input(next_symbol_id, num_symbols_in_file),
@@ -185,8 +181,7 @@ pub(crate) fn create_groups<'data, P: Platform>(
                 group_objects.len()
             );
 
-            let objects_slice =
-                allocator.alloc_slice_fill_iter(core::mem::take(&mut group_objects));
+            let objects_slice = allocator.alloc_slice_fill_iter(group_objects.drain(..));
 
             symbol_db.add_group(Group::Objects(objects_slice));
         }
@@ -286,7 +281,6 @@ fn determine_max_files_per_group(args: &impl platform::Args) -> usize {
 /// Compute the total number of symbols in the supplied objects.
 fn count_symbols<P: Platform>(objects: &[Box<ParsedInputObject<P>>]) -> usize {
     verbose_timing_phase!("Count symbols");
-
     objects.iter().map(|o| o.num_symbols()).sum::<usize>()
 }
 

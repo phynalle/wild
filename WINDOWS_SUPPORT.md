@@ -47,10 +47,11 @@ linker = "D:/Workspace/wild/target/release/wild.exe"
   `/NO-MMAP-OUTPUT-FILE`, `/UPDATE-IN-PLACE`, `/NO-UPDATE-IN-PLACE` and
   `/UPDATE-IN-PLACE-WITH-FALLBACK` for profiling and output control.
 
-The new `libwild/src/coff/` backend owns COFF symbol resolution and PE layout,
-while sharing wild's argument infrastructure, filesystem/output abstractions,
-archive reader and error reporting. It avoids treating PE semantics as ELF
-semantics and leaves the existing ELF linking pipeline intact.
+The `libwild/src/coff/` backend supplies COFF policies and PE encoding to the
+common linking engine. Input management, the sole symbol definition store
+(`SymbolDb`), resolution, parallel GC, layout and address calculation use the
+same engine as ELF. The PE writer consumes the resulting `Layout<Coff>`; there
+is no separate COFF engine, engine-selection option or external-linker fallback.
 
 ## Limitations
 
@@ -64,13 +65,21 @@ silently substituted for an executable: `/DLL` fails explicitly.
 
 Support does not cover every possible MSVC library convention. Legacy long-form import objects mixed
 with synthesized short imports are not part of the verified compatibility set.
-COFF uses indexed lazy archive parsing, compact interned symbol names, input
-mapping ranges, associative-section adjacency lists and a symbol worklist.
-Large parsing batches, subsection sorts and disjoint output contributions use
-wild's existing Rayon pool and jobserver limits. Activation and diagnostics are
-merged deterministically. Small batches stay serial. PE contributions are
-copied and relocated directly in the final image; Windows complete-output
-writes avoid a second buffered image and honor file replacement semantics.
+Optional COFF archive members receive lightweight symbol catalogs; only selected
+members materialize section bodies, relocations and directives. Candidate
+discovery currently scans member symbol metadata rather than relying solely on
+archive indexes, preserving index-less and incomplete-index behavior. Raw symbol
+indices, including auxiliary entries, remain stable across materialization.
+Byte-identical optional short imports share their first candidate in the common
+input-registration path; wholearchive and normal object inputs remain distinct.
+Large parsing batches and disjoint output contributions use wild's existing
+Rayon pool and jobserver limits. COMDAT winners are selected in stable input
+order within hash shards, and subsection sorting uses precomputed dense ranks.
+Activation and diagnostics are merged deterministically. PE contributions are
+copied and relocated directly in the final mapped image, honoring explicit
+buffering and file replacement options. Successful Windows COFF CLI links return
+jobserver tokens and finalize output, input checks and tracing before process
+exit; library calls and failed links retain normal cleanup.
 
 ## Tests
 

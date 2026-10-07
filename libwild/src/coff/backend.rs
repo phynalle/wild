@@ -102,6 +102,7 @@ use crate::symbol_db::{SymbolDb, SymbolId};
 use crate::value_flags::{AtomicPerSymbolFlags, ValueFlags};
 use crate::{FileSystem, OutputKind, bail};
 use rayon::Scope;
+use rayon::prelude::*;
 use std::num::NonZeroU32;
 
 #[allow(unused_variables)]
@@ -113,6 +114,11 @@ impl platform::Platform for Coff {
         Some(SectionIdentity::new(name, ()))
     }
     type InputResolutionState = InputState;
+    const CACHE_PREFERRED_SYMBOLS: bool = true;
+    const BUCKET_SORTED_SECTIONS: bool = true;
+    fn section_sort_rank(section: &Section) -> usize {
+        section.layout_sort_rank.load(Ordering::Relaxed) as usize
+    }
     fn entry_point<'a>(
         db: &'a SymbolDb<Self>,
         inferred: Option<&'a [u8]>,
@@ -181,7 +187,10 @@ impl platform::Platform for Coff {
                 .input_to_id(object::SymbolIndex(fallback));
         } else {
             let attributes = crate::resolution::SymbolAttributes {
-                name_info: Name(file.symbol_name(fallback_symbol)?),
+                name_info: Name(
+                    file.symbol_name(fallback_symbol)?,
+                    Some(fallback_symbol.name_hash),
+                ),
                 is_local: false,
                 default_visibility: false,
                 is_weak: false,
@@ -235,27 +244,24 @@ impl platform::Platform for Coff {
         groups: &[crate::resolution::ResolvedGroup<'data, Self>],
     ) -> Result {
         let representatives = crate::timing_guard!("Select COMDAT representatives");
-        let mut selected: crate::hash::PassThroughHashMap<Cow<'data, [u8]>, (&File<'data>, usize)> =
-            Default::default();
-        selected.reserve(
-            groups
-                .iter()
-                .flat_map(|g| &g.files)
-                .filter_map(|f| {
-                    if let crate::resolution::ResolvedFile::Object(object) = f {
-                        Some(object.common.object)
-                    } else {
-                        None
-                    }
-                })
-                .map(|f| {
-                    f.sections
-                        .iter()
-                        .filter(|s| s.selection != 0 && s.selection != 5 && !s.should_exclude())
-                        .count()
-                })
-                .sum(),
-        );
+        let section_count: usize = groups
+            .iter()
+            .flat_map(|g| &g.files)
+            .filter_map(|f| {
+                if let crate::resolution::ResolvedFile::Object(object) = f {
+                    Some(object.common.object)
+                } else {
+                    None
+                }
+            })
+            .map(|f| f.sections.len())
+            .sum();
+        let shards = if section_count < 4096 {
+            1
+        } else {
+            rayon::current_num_threads().min(16).next_power_of_two()
+        };
+        let mut candidates: Vec<Vec<_>> = (0..shards).map(|_| Vec::new()).collect();
         let mut files = Vec::new();
         for group in groups {
             for file in &group.files {
@@ -289,70 +295,43 @@ impl platform::Platform for Coff {
                         crate::hash::hash_bytes(&key)
                     };
                     let key = crate::hash::PreHashed::new(key, hash);
-                    let mut entry = match selected.entry(key) {
-                        hashbrown::hash_map::Entry::Vacant(entry) => {
-                            entry.insert((file, index));
-                            continue;
-                        }
-                        hashbrown::hash_map::Entry::Occupied(entry) => entry,
-                    };
-                    let &(old_file, old_index) = entry.get();
-                    let old = &old_file.sections[old_index];
-                    let replace = match section.selection {
-                        1 => bail!(
-                            "Duplicate NODUPLICATES COMDAT {}",
-                            String::from_utf8_lossy(entry.key())
-                        ),
-                        2 => false,
-                        3 => {
-                            crate::ensure!(
-                                old.size == section.size,
-                                "COMDAT size mismatch: {}",
-                                String::from_utf8_lossy(entry.key())
-                            );
-                            false
-                        }
-                        4 => {
-                            let same = old_file.raw_section_data(old)?
-                                == file.raw_section_data(section)?
-                                && old.size == section.size
-                                && old.relocations.len() == section.relocations.len()
-                                && old_file
-                                    .relocations(object::SectionIndex(old_index), &())?
-                                    .rel_iter()
-                                    .zip(
-                                        file.relocations(object::SectionIndex(index), &())?
-                                            .rel_iter(),
-                                    )
-                                    .all(|(a, b)| {
-                                        a.offset == b.offset
-                                            && a.kind == b.kind
-                                            && old_file
-                                                .symbol_name(&old_file.symbols[a.symbol as usize])
-                                                .ok()
-                                                == file
-                                                    .symbol_name(&file.symbols[b.symbol as usize])
-                                                    .ok()
-                                    });
-                            crate::ensure!(
-                                same,
-                                "COMDAT content mismatch: {}",
-                                String::from_utf8_lossy(entry.key())
-                            );
-                            false
-                        }
-                        6 => section.size > old.size,
-                        7 => true,
-                        selection => bail!("Unsupported COMDAT selection {selection}"),
-                    };
-                    if replace {
-                        old.excluded.store(true, Ordering::Relaxed);
-                        entry.insert((file, index));
-                    } else {
-                        section.excluded.store(true, Ordering::Relaxed);
+                    candidates[hash as usize & (shards - 1)].push((
+                        (files.len() - 1, index),
+                        key,
+                        file,
+                        index,
+                    ));
+                }
+            }
+        }
+        // Each key stays on one worker, with candidates in original input order.
+        let results: Vec<_> = candidates
+            .into_par_iter()
+            .map(|candidates| {
+                crate::verbose_timing_phase!("Select COMDAT shard", candidates = candidates.len());
+                let mut selected: ComdatSelection<'data> = Default::default();
+                selected.reserve(candidates.len());
+                for (order, key, file, index) in candidates {
+                    select_comdat_candidate(&mut selected, key, file, index)
+                        .map_err(|error| (order, error))?;
+                }
+                Ok::<_, ((usize, usize), crate::error::Error)>(selected)
+            })
+            .collect();
+        let mut selected = Vec::with_capacity(shards);
+        let mut first_error = None;
+        for result in results {
+            match result {
+                Ok(map) => selected.push(map),
+                Err((order, error)) => {
+                    if first_error.as_ref().is_none_or(|(old, _)| order < *old) {
+                        first_error = Some((order, error));
                     }
                 }
             }
+        }
+        if let Some((_, error)) = first_error {
+            return Err(error);
         }
         drop(representatives);
         let ranges: std::collections::BTreeMap<usize, _> = files
@@ -383,7 +362,9 @@ impl platform::Platform for Coff {
                     crate::hash::hash_bytes(&key)
                 };
                 let key = crate::hash::PreHashed::new(key, hash);
-                let Some(&(winner, winner_index)) = selected.get(&key) else {
+                let Some(&(winner, winner_index)) =
+                    selected[hash as usize & (shards - 1)].get(&key)
+                else {
                     continue;
                 };
                 let anchor = winner.sections[winner_index]
@@ -428,7 +409,12 @@ impl platform::Platform for Coff {
         symbol: &Symbol,
         _: object::SymbolIndex,
     ) -> bool {
-        symbol.section <= 0 || !file.sections[symbol.section as usize - 1].should_exclude()
+        symbol.section <= 0
+            || if file.deferred && file.materialized.get().is_none() {
+                !file.catalog_excluded[symbol.section as usize - 1]
+            } else {
+                !file.sections[symbol.section as usize - 1].should_exclude()
+            }
     }
     fn resolve_input_extensions<'data, F: FileSystem>(
         state: &mut InputState,
@@ -463,16 +449,16 @@ impl platform::Platform for Coff {
         }
         let mut texts = Vec::new();
         let mut has_tls = false;
-        for group in &resolver.resolved_groups {
-            for file in &group.files {
-                if let crate::resolution::ResolvedFile::Object(object) = file {
-                    if state.processed.insert(object.common.file_id) {
-                        texts.extend(object.common.object.directives.iter().cloned());
-                        has_tls |= object.common.object.sections.iter().any(|s| {
-                            &object.common.object.data[s.name.range()] == b".tls"
-                                || object.common.object.data[s.name.range()].starts_with(b".tls$")
-                        });
-                    }
+        for id in &resolver.activated_files {
+            if let crate::resolution::ResolvedFile::Object(object) =
+                &resolver.resolved_groups[id.group()].files[id.file()]
+            {
+                if state.processed.insert(*id) {
+                    texts.extend(object.common.object.directives.iter().cloned());
+                    has_tls |= object.common.object.sections.iter().any(|s| {
+                        &object.common.object.data[s.name.range()] == b".tls"
+                            || object.common.object.data[s.name.range()].starts_with(b".tls$")
+                    });
                 }
             }
         }
@@ -610,66 +596,101 @@ impl platform::Platform for Coff {
         rules: &mut crate::layout_rules::LayoutRulesBuilder<'data>,
     ) -> Result {
         let allocator = db.herd.get();
-        let mut names: std::collections::BTreeMap<&[u8], (u32, u32)> = Default::default();
-        for group in resolved {
-            for file in &group.files {
-                if let crate::resolution::ResolvedFile::Object(object) = file {
-                    if object.common.object.import.is_some() {
-                        continue;
-                    }
-                    for (index, section) in object.common.object.enumerate_sections() {
-                        if section.should_exclude() {
-                            continue;
-                        }
-                        let name = object.common.object.section_name(index)?;
-                        let value = names.entry(name).or_insert((0, 1));
-                        value.0 |= section.flags;
-                        value.1 = value.1.max(section.alignment);
-                    }
-                }
-            }
-        }
-        for group in resolved {
-            for file in &group.files {
-                if let crate::resolution::ResolvedFile::Object(object) = file {
-                    for (index, section) in object.common.object.enumerate_sections() {
-                        if section.should_exclude() {
-                            continue;
-                        }
-                        if let Some((_, alignment)) =
-                            names.get(object.common.object.section_name(index)?)
-                        {
-                            section
-                                .layout_alignment
-                                .store(*alignment, Ordering::Relaxed);
-                        }
-                        let name = std::str::from_utf8(
-                            object
-                                .common
-                                .object
-                                .section_name(index)?
-                                .split(|b| *b == b'$')
-                                .next()
-                                .unwrap(),
-                        )?;
-                        let mut target = name;
-                        for _ in 0..32 {
-                            if let Some(next) = state.merges.get(target) {
-                                target = next;
-                            } else {
-                                break;
+        let batches: Vec<Result<hashbrown::HashMap<&[u8], (u32, u32)>>> = resolved
+            .par_chunks(16)
+            .map(|groups| {
+                let mut names: hashbrown::HashMap<&[u8], (u32, u32)> = Default::default();
+                for group in groups {
+                    for file in &group.files {
+                        if let crate::resolution::ResolvedFile::Object(object) = file {
+                            if object.common.object.import.is_some() {
+                                continue;
+                            }
+                            for (index, section) in object.common.object.enumerate_sections() {
+                                if section.should_exclude() {
+                                    continue;
+                                }
+                                let name = object.common.object.section_name(index)?;
+                                let value = names.entry(name).or_insert((0, 1));
+                                value.0 |= section.flags;
+                                value.1 = value.1.max(section.alignment);
                             }
                         }
-                        if let Some(bits) = state.attributes.get(target) {
-                            section
-                                .output_flags
-                                .store((section.flags & !0xfe000000) | bits, Ordering::Relaxed);
+                    }
+                }
+                Ok(names)
+            })
+            .collect();
+        let mut names: hashbrown::HashMap<&[u8], (u32, u32)> = Default::default();
+        for batch in batches {
+            for (name, (flags, alignment)) in batch? {
+                let value = names.entry(name).or_insert((0, 1));
+                value.0 |= flags;
+                value.1 = value.1.max(alignment);
+            }
+        }
+        let mut ordered_names: Vec<_> = names.into_iter().collect();
+        ordered_names.sort_unstable_by_key(|(name, _)| *name);
+        let names: hashbrown::HashMap<_, _> = ordered_names
+            .iter()
+            .enumerate()
+            .map(|(rank, &(name, (_, alignment)))| Ok((name, (alignment, u32::try_from(rank)?))))
+            .collect::<Result<_>>()?;
+        let batches: Vec<Result> = resolved
+            .par_chunks(16)
+            .map(|groups| {
+                for group in groups {
+                    for file in &group.files {
+                        if let crate::resolution::ResolvedFile::Object(object) = file {
+                            for (index, section) in object.common.object.enumerate_sections() {
+                                if section.should_exclude() {
+                                    continue;
+                                }
+                                if let Some((alignment, rank)) =
+                                    names.get(object.common.object.section_name(index)?)
+                                {
+                                    section
+                                        .layout_alignment
+                                        .store(*alignment, Ordering::Relaxed);
+                                    section.layout_sort_rank.store(*rank, Ordering::Relaxed);
+                                }
+                                if state.attributes.is_empty() {
+                                    continue;
+                                }
+                                let name = std::str::from_utf8(
+                                    object
+                                        .common
+                                        .object
+                                        .section_name(index)?
+                                        .split(|b| *b == b'$')
+                                        .next()
+                                        .unwrap(),
+                                )?;
+                                let mut target = name;
+                                for _ in 0..32 {
+                                    if let Some(next) = state.merges.get(target) {
+                                        target = next;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                if let Some(bits) = state.attributes.get(target) {
+                                    section.output_flags.store(
+                                        (section.flags & !0xfe000000) | bits,
+                                        Ordering::Relaxed,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
-            }
+                Ok(())
+            })
+            .collect();
+        for result in batches {
+            result?;
         }
-        for (name, (flags, alignment)) in names {
+        for (name, (flags, alignment)) in ordered_names {
             let base = std::str::from_utf8(name.split(|b| *b == b'$').next().unwrap_or(name))?;
             let mut target = base;
             let mut depth = 0;
@@ -750,16 +771,21 @@ impl platform::Platform for Coff {
         file: &mut File<'data>,
         allocator: &bumpalo_herd::Member<'data>,
     ) -> Result {
-        if let Some(import) = &file.import {
+        if let Some(import) = &file.contents.import {
             // Short imports expose names for archive selection; their real storage is synthesized
             // only after the shared resolver has selected the corresponding members.
             let name = import.symbol.as_bytes();
-            let bytes = [b".idata$5".as_slice(), name, b"__imp_", name].concat();
-            file.data = allocator.alloc_slice_copy(&bytes);
+            let bytes = allocator.alloc_slice_fill_copy(14 + name.len() * 2, 0);
+            bytes[..8].copy_from_slice(b".idata$5");
+            bytes[8..8 + name.len()].copy_from_slice(name);
+            bytes[8 + name.len()..14 + name.len()].copy_from_slice(b"__imp_");
+            bytes[14 + name.len()..].copy_from_slice(name);
+            file.data = bytes;
             let end = u32::try_from(8 + name.len())?;
-            file.symbols = vec![
+            file.symbols = input::SymbolTable::Borrowed(allocator.alloc_slice_copy(&[
                 Symbol {
                     name: input::ByteRange { start: 8, end },
+                    name_hash: crate::hash::hash_bytes(name),
                     section: 1,
                     class: 2,
                     ..Default::default()
@@ -769,17 +795,19 @@ impl platform::Platform for Coff {
                         start: end,
                         end: u32::try_from(bytes.len())?,
                     },
+                    name_hash: crate::hash::hash_bytes(&bytes[end as usize..]),
                     section: 1,
                     class: 2,
                     ..Default::default()
                 },
-            ];
-            file.sections = vec![Section {
+            ]));
+            file.sections = SectionTable::Borrowed(allocator.alloc_slice_fill_iter([Section {
                 name: input::ByteRange { start: 0, end: 8 },
                 data: Default::default(),
                 size: 0,
                 alignment: 1,
                 layout_alignment: std::sync::atomic::AtomicU32::new(1),
+                layout_sort_rank: std::sync::atomic::AtomicU32::new(0),
                 flags: 0xc0000040,
                 output_flags: std::sync::atomic::AtomicU32::new(0xc0000040),
                 selection: 0,
@@ -790,8 +818,8 @@ impl platform::Platform for Coff {
                 relocations: Default::default(),
                 excluded: AtomicBool::new(false),
                 retain: false,
-            }];
-            file.child_offsets = vec![0, 0];
+            }]));
+            // Import placeholders have no associative edges and are discarded before GC.
         }
         Ok(())
     }
@@ -1276,7 +1304,7 @@ impl platform::Platform for Coff {
         verneed_table: &Self::VerneedTable<'data>,
         symbol_index: object::SymbolIndex,
     ) -> Self::RawSymbolName<'data> {
-        Name(name_bytes)
+        Name(name_bytes, None)
     }
     fn default_layout_rules(args: &Self::Args) -> Vec<SectionRule<'static>> {
         Vec::new()
@@ -1498,15 +1526,140 @@ pub(crate) struct FinalSizes {
     pub base_relocations: usize,
 }
 
+type ComdatSelection<'data> =
+    crate::hash::PassThroughHashMap<Cow<'data, [u8]>, (&'data File<'data>, usize)>;
+
+fn select_comdat_candidate<'data>(
+    selected: &mut ComdatSelection<'data>,
+    key: crate::hash::PreHashed<Cow<'data, [u8]>>,
+    file: &'data File<'data>,
+    index: usize,
+) -> Result {
+    let mut entry = match selected.entry(key) {
+        hashbrown::hash_map::Entry::Vacant(entry) => {
+            entry.insert((file, index));
+            return Ok(());
+        }
+        hashbrown::hash_map::Entry::Occupied(entry) => entry,
+    };
+    let &(old_file, old_index) = entry.get();
+    let old = &old_file.sections[old_index];
+    let section = &file.sections[index];
+    let replace = match section.selection {
+        1 => bail!(
+            "Duplicate NODUPLICATES COMDAT {}",
+            String::from_utf8_lossy(entry.key())
+        ),
+        2 => false,
+        3 => {
+            crate::ensure!(
+                old.size == section.size,
+                "COMDAT size mismatch: {}",
+                String::from_utf8_lossy(entry.key())
+            );
+            false
+        }
+        4 => {
+            let same = old_file.raw_section_data(old)? == file.raw_section_data(section)?
+                && old.size == section.size
+                && old.relocations.len() == section.relocations.len()
+                && old_file
+                    .relocations(object::SectionIndex(old_index), &())?
+                    .rel_iter()
+                    .zip(
+                        file.relocations(object::SectionIndex(index), &())?
+                            .rel_iter(),
+                    )
+                    .all(|(a, b)| {
+                        a.offset == b.offset
+                            && a.kind == b.kind
+                            && old_file
+                                .symbol_name(&old_file.symbols[a.symbol as usize])
+                                .ok()
+                                == file.symbol_name(&file.symbols[b.symbol as usize]).ok()
+                    });
+            crate::ensure!(
+                same,
+                "COMDAT content mismatch: {}",
+                String::from_utf8_lossy(entry.key())
+            );
+            false
+        }
+        6 => section.size > old.size,
+        7 => true,
+        selection => bail!("Unsupported COMDAT selection {selection}"),
+    };
+    if replace {
+        old.excluded.store(true, Ordering::Relaxed);
+        entry.insert((file, index));
+    } else {
+        section.excluded.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub(crate) struct File<'data> {
     pub data: &'data [u8],
-    pub sections: Vec<Section>,
-    pub symbols: Vec<Symbol>,
+    contents: FileContents<'data>,
+    materialized: std::sync::OnceLock<Box<FileContents<'data>>>,
+    deferred: bool,
+    catalog_excluded: Vec<bool>,
+}
+
+#[derive(Debug)]
+pub(crate) struct FileContents<'data> {
+    pub sections: SectionTable<'data>,
+    pub symbols: input::SymbolTable<'data>,
     pub directives: Vec<String>,
-    pub import: Option<input::Import>,
+    pub import: Option<input::Import<'data>>,
     pub child_offsets: Vec<usize>,
     pub children: Vec<usize>,
+}
+
+impl<'data> std::ops::Deref for File<'data> {
+    type Target = FileContents<'data>;
+    fn deref(&self) -> &Self::Target {
+        self.materialized.get().map_or(&self.contents, |v| &**v)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum SectionTable<'data> {
+    Owned(Vec<Section>),
+    Borrowed(&'data [Section]),
+}
+
+impl From<Vec<Section>> for SectionTable<'_> {
+    fn from(sections: Vec<Section>) -> Self {
+        Self::Owned(sections)
+    }
+}
+
+impl std::ops::Deref for SectionTable<'_> {
+    type Target = [Section];
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(sections) => sections,
+            Self::Borrowed(sections) => sections,
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a SectionTable<'_> {
+    type Item = &'a Section;
+    type IntoIter = std::slice::Iter<'a, Section>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl std::ops::DerefMut for File<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.materialized
+            .get_mut()
+            .map_or(&mut self.contents, |v| &mut **v)
+    }
 }
 
 #[derive(Debug)]
@@ -1516,6 +1669,7 @@ pub(crate) struct Section {
     pub size: u32,
     pub alignment: u32,
     pub layout_alignment: std::sync::atomic::AtomicU32,
+    pub layout_sort_rank: std::sync::atomic::AtomicU32,
     pub flags: u32,
     pub output_flags: std::sync::atomic::AtomicU32,
     pub selection: u8,
@@ -1706,58 +1860,66 @@ impl platform::SectionAttributes for Attributes {
 
 impl<'data> File<'data> {
     fn parse_coff(data: &'data [u8], name: String) -> Result<Self> {
-        match input::parse(data, name)? {
-            input::Parsed::Object(object) => Ok(Self {
-                data,
-                sections: object
-                    .sections
-                    .into_iter()
-                    .map(|s| Section {
-                        name: s.name,
-                        data: s.data,
-                        size: s.size,
-                        alignment: s.align,
-                        layout_alignment: std::sync::atomic::AtomicU32::new(s.align),
-                        flags: s.flags,
-                        output_flags: std::sync::atomic::AtomicU32::new(s.flags),
-                        selection: s.selection,
-                        parent: s.parent,
-                        representative: s.key_symbol,
-                        key_hash: s.key_symbol.map_or(0, |index| {
-                            crate::hash::hash_bytes(
-                                &data[object.symbols[index as usize].name.range()],
-                            )
-                        }),
-                        anchor_symbol: s.anchor_symbol,
-                        relocations: s.relocs,
-                        excluded: AtomicBool::new(s.excluded),
-                        retain: s.selection == 0 || s.tls || s.crt,
-                    })
-                    .collect(),
-                symbols: object.symbols,
-                directives: object.directives,
-                import: None,
-                child_offsets: object.child_offsets,
-                children: object.children,
-            }),
-            input::Parsed::Metadata => Ok(Self {
-                data,
-                sections: Vec::new(),
-                symbols: Vec::new(),
+        let contents = match input::parse(data, name)? {
+            input::Parsed::Object(object) => Self::object_contents(object),
+            input::Parsed::Metadata => FileContents {
+                sections: Vec::new().into(),
+                symbols: Default::default(),
                 directives: Vec::new(),
                 import: None,
                 child_offsets: Vec::new(),
                 children: Vec::new(),
-            }),
-            input::Parsed::Import(import) => Ok(Self {
-                data,
-                sections: Vec::new(),
-                symbols: Vec::new(),
+            },
+            input::Parsed::Import(import) => FileContents {
+                sections: Vec::new().into(),
+                symbols: Default::default(),
                 directives: Vec::new(),
                 import: Some(import),
                 child_offsets: Vec::new(),
                 children: Vec::new(),
-            }),
+            },
+        };
+        Ok(Self {
+            data,
+            contents,
+            materialized: Default::default(),
+            deferred: false,
+            catalog_excluded: Vec::new(),
+        })
+    }
+
+    fn object_contents(object: input::Object) -> FileContents<'data> {
+        FileContents {
+            sections: object
+                .sections
+                .into_iter()
+                .map(|s| Section {
+                    name: s.name,
+                    data: s.data,
+                    size: s.size,
+                    alignment: s.align,
+                    layout_alignment: std::sync::atomic::AtomicU32::new(s.align),
+                    layout_sort_rank: std::sync::atomic::AtomicU32::new(0),
+                    flags: s.flags,
+                    output_flags: std::sync::atomic::AtomicU32::new(s.flags),
+                    selection: s.selection,
+                    parent: s.parent,
+                    representative: s.key_symbol,
+                    key_hash: s
+                        .key_symbol
+                        .map_or(0, |index| object.symbols[index as usize].name_hash),
+                    anchor_symbol: s.anchor_symbol,
+                    relocations: s.relocs,
+                    excluded: AtomicBool::new(s.excluded),
+                    retain: s.selection == 0 || s.tls || s.crt,
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            symbols: object.symbols,
+            directives: object.directives,
+            import: None,
+            child_offsets: object.child_offsets,
+            children: object.children,
         }
     }
 }
@@ -1813,7 +1975,7 @@ impl platform::Relocation for Relocation {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Name<'data>(pub &'data [u8]);
+pub(crate) struct Name<'data>(pub &'data [u8], pub Option<u64>);
 impl std::fmt::Display for Name<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", String::from_utf8_lossy(self.0))
@@ -1821,10 +1983,17 @@ impl std::fmt::Display for Name<'_> {
 }
 impl<'data> platform::RawSymbolName<'data> for Name<'data> {
     fn parse(bytes: &'data [u8]) -> Self {
-        Self(bytes)
+        Self(bytes, None)
     }
     fn name(&self) -> &'data [u8] {
         self.0
+    }
+    fn name_hash(&self) -> u64 {
+        self.1.unwrap_or_else(|| crate::hash::hash_bytes(self.0))
+    }
+    fn with_name_hash(mut self, hash: Option<u64>) -> Self {
+        self.1 = hash;
+        self
     }
     fn version_name(&self) -> Option<&'data [u8]> {
         None
@@ -1855,7 +2024,7 @@ impl platform::NonAddressableIndexes for Indexes {
 pub(crate) struct BuiltIn;
 impl platform::BuiltInSectionDetails for BuiltIn {}
 
-fn imports_object(imports: &mut Vec<input::Import>) -> Result<Vec<u8>> {
+fn imports_object(imports: &mut Vec<input::Import<'_>>) -> Result<Vec<u8>> {
     use object::write::{Object, Relocation, Symbol, SymbolSection};
     use object::{
         Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags,
@@ -1995,10 +2164,44 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         Self::parse_coff(data, "<COFF object>".into())
     }
     fn parse(input: &crate::input_data::InputBytes<'data>, _: &CoffArgs) -> Result<Self> {
-        Self::parse_coff(input.data, input.input.to_string())
+        if input.input.has_archive_semantics() && !input.modifiers.whole_archive {
+            if let Some(object) = input::catalog(input.data, "<COFF archive member>")? {
+                return Ok(Self {
+                    data: input.data,
+                    contents: FileContents {
+                        sections: Vec::new().into(),
+                        symbols: object.symbols,
+                        directives: Vec::new(),
+                        import: None,
+                        child_offsets: Vec::new(),
+                        children: Vec::new(),
+                    },
+                    materialized: Default::default(),
+                    deferred: true,
+                    catalog_excluded: object.excluded,
+                });
+            }
+        }
+        // The shared parser adds the input path only when reporting an error.
+        Self::parse_coff(input.data, "<COFF object>".into())
+    }
+    fn materialize(&self) -> Result<bool> {
+        if !self.deferred || self.materialized.get().is_some() {
+            return Ok(false);
+        }
+        let parsed = Self::parse_coff(self.data, "<selected COFF member>".into())?;
+        crate::ensure!(
+            parsed.num_symbols() == self.num_symbols()
+                && parsed.num_sections() == self.num_sections(),
+            "COFF catalog changed during materialization"
+        );
+        Ok(self.materialized.set(Box::new(parsed.contents)).is_ok())
     }
     fn is_dynamic(&self) -> bool {
         false
+    }
+    fn permits_optional_input_coalescing(&self) -> bool {
+        self.import.is_some()
     }
     fn num_symbols(&self) -> usize {
         self.symbols.len()
@@ -2017,11 +2220,18 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
     fn symbol_name(&self, symbol: &Symbol) -> Result<&'data [u8]> {
         Ok(&self.data[symbol.name.range()])
     }
+    fn symbol_name_hash(&self, symbol: &Symbol) -> Option<u64> {
+        (!symbol.is_local()).then_some(symbol.name_hash)
+    }
     fn symbol_offset_in_section(&self, symbol: &Symbol, _: object::SectionIndex) -> Result<u64> {
         Ok(u64::from(symbol.value))
     }
     fn num_sections(&self) -> usize {
-        self.sections.len()
+        if self.deferred && self.materialized.get().is_none() {
+            self.catalog_excluded.len()
+        } else {
+            self.sections.len()
+        }
     }
     fn section_iter(&self) -> std::slice::Iter<'_, Section> {
         self.sections.iter()
@@ -2087,8 +2297,8 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
             data.len() <= out.len(),
             "COFF section data exceeds output allocation"
         );
-        out.fill(0);
         out[..data.len()].copy_from_slice(data);
+        out[data.len()..].fill(0);
         Ok(())
     }
     fn section_data_cow(&self, section: &Section) -> Result<Cow<'data, [u8]>> {
@@ -2125,7 +2335,10 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         _: usize,
         _: &(),
     ) -> Result<Name<'data>> {
-        Ok(Name(self.symbol_name(symbol)?))
+        Ok(Name(
+            self.symbol_name(symbol)?,
+            self.symbol_name_hash(symbol),
+        ))
     }
     fn should_enforce_undefined(&self, _: &layout::GraphResources<'data, '_, Coff>) -> bool {
         false

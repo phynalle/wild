@@ -182,11 +182,13 @@ pub fn compute<'data, P: Platform, A: Arch<Platform = P>, F: FileSystem>(
     );
 
     group_states.push(GroupState {
-        files: vec![FileLayoutState::Epilogue(EpilogueLayoutState::new(
-            symbol_db.args,
-            symbol_db.output_kind,
-            &mut dynamic_symbol_definitions,
-            &group_states,
+        files: vec![FileLayoutState::Epilogue(Box::new(
+            EpilogueLayoutState::new(
+                symbol_db.args,
+                symbol_db.output_kind,
+                &mut dynamic_symbol_definitions,
+                &group_states,
+            ),
         ))],
         queue: LocalWorkQueue::new(epilogue_file_id.group()),
         common: CommonGroupState::new(&output_sections),
@@ -803,7 +805,7 @@ pub(crate) fn objects_iter<'groups, 'data, P: Platform>(
 ) -> impl Iterator<Item = &'groups ObjectLayoutState<'data, P>> + Clone {
     group_states.iter().flat_map(|group| {
         group.files.iter().filter_map(|file| match file {
-            FileLayoutState::Object(object) => Some(object),
+            FileLayoutState::Object(object) => Some(&**object),
             _ => None,
         })
     })
@@ -1030,15 +1032,16 @@ impl<P: Platform> SymbolResolutions<P> {
     }
 }
 
+// Unselected archive members keep an ID slot, not storage for a full object layout.
 pub(crate) enum FileLayout<'data, P: Platform> {
-    Prelude(PreludeLayout<'data, P>),
-    Object(ObjectLayout<'data, P>),
-    Dynamic(DynamicLayout<'data, P>),
-    SyntheticSymbols(SyntheticSymbolsLayout<'data, P>),
-    Epilogue(EpilogueLayout<P>),
-    StubLibrary(StubLibraryLayout<P>),
+    Prelude(Box<PreludeLayout<'data, P>>),
+    Object(Box<ObjectLayout<'data, P>>),
+    Dynamic(Box<DynamicLayout<'data, P>>),
+    SyntheticSymbols(Box<SyntheticSymbolsLayout<'data, P>>),
+    Epilogue(Box<EpilogueLayout<P>>),
+    StubLibrary(Box<StubLibraryLayout<P>>),
     NotLoaded,
-    LinkerScript(LinkerScriptLayoutState<'data, P>),
+    LinkerScript(Box<LinkerScriptLayoutState<'data, P>>),
 }
 
 /// Address information for a symbol.
@@ -1089,14 +1092,14 @@ impl SectionResolution {
 }
 
 pub(crate) enum FileLayoutState<'data, P: Platform> {
-    Prelude(PreludeLayoutState<'data, P>),
-    Object(ObjectLayoutState<'data, P>),
-    Dynamic(DynamicLayoutState<'data, P>),
-    StubLibrary(StubLibraryLayoutState<'data, P>),
+    Prelude(Box<PreludeLayoutState<'data, P>>),
+    Object(Box<ObjectLayoutState<'data, P>>),
+    Dynamic(Box<DynamicLayoutState<'data, P>>),
+    StubLibrary(Box<StubLibraryLayoutState<'data, P>>),
     NotLoaded(NotLoaded),
-    SyntheticSymbols(SyntheticSymbolsLayoutState<'data, P>),
-    Epilogue(EpilogueLayoutState<P>),
-    LinkerScript(LinkerScriptLayoutState<'data, P>),
+    SyntheticSymbols(Box<SyntheticSymbolsLayoutState<'data, P>>),
+    Epilogue(Box<EpilogueLayoutState<P>>),
+    LinkerScript(Box<LinkerScriptLayoutState<'data, P>>),
 }
 
 /// Data that doesn't come from any input files, but needs to be written by the linker.
@@ -3106,7 +3109,12 @@ impl<'data, P: Platform> FileLayoutState<'data, P> {
                     object.export_dynamic::<A>(common, symbol_id, resources, queue, scope)
                 }
                 FileLayoutState::LinkerScript(state) => SymbolRequestHandler::load_symbol::<A>(
-                    state, common, symbol_id, resources, queue, scope,
+                    state.as_mut(),
+                    common,
+                    symbol_id,
+                    resources,
+                    queue,
+                    scope,
                 ),
                 _ => {
                     // Non-loaded and dynamic objects don't do anything in response to a request to
@@ -3128,22 +3136,42 @@ impl<'data, P: Platform> FileLayoutState<'data, P> {
         match self {
             FileLayoutState::Object(state) => {
                 SymbolRequestHandler::load_symbol::<A>(
-                    state, common, symbol_id, resources, queue, scope,
+                    state.as_mut(),
+                    common,
+                    symbol_id,
+                    resources,
+                    queue,
+                    scope,
                 )?;
             }
             FileLayoutState::Prelude(state) => {
                 SymbolRequestHandler::load_symbol::<A>(
-                    state, common, symbol_id, resources, queue, scope,
+                    state.as_mut(),
+                    common,
+                    symbol_id,
+                    resources,
+                    queue,
+                    scope,
                 )?;
             }
             FileLayoutState::Dynamic(state) => {
                 SymbolRequestHandler::load_symbol::<A>(
-                    state, common, symbol_id, resources, queue, scope,
+                    state.as_mut(),
+                    common,
+                    symbol_id,
+                    resources,
+                    queue,
+                    scope,
                 )?;
             }
             FileLayoutState::LinkerScript(state) => {
                 SymbolRequestHandler::load_symbol::<A>(
-                    state, common, symbol_id, resources, queue, scope,
+                    state.as_mut(),
+                    common,
+                    symbol_id,
+                    resources,
+                    queue,
+                    scope,
                 )?;
             }
             FileLayoutState::StubLibrary(state) => {
@@ -3152,7 +3180,12 @@ impl<'data, P: Platform> FileLayoutState<'data, P> {
             FileLayoutState::NotLoaded(_) => {}
             FileLayoutState::SyntheticSymbols(state) => {
                 SymbolRequestHandler::load_symbol::<A>(
-                    state, common, symbol_id, resources, queue, scope,
+                    state.as_mut(),
+                    common,
+                    symbol_id,
+                    resources,
+                    queue,
+                    scope,
                 )?;
             }
             FileLayoutState::Epilogue(_) => {
@@ -3179,21 +3212,23 @@ impl<'data, P: Platform> FileLayoutState<'data, P> {
                     file = %s.input
                 )
                 .entered();
-                FileLayout::Object(s.finalise_layout(memory_offsets, resolutions_out, resources)?)
+                FileLayout::Object(Box::new(s.finalise_layout(
+                    memory_offsets,
+                    resolutions_out,
+                    resources,
+                )?))
             }
-            Self::Prelude(s) => FileLayout::Prelude(s.finalise_layout(
+            Self::Prelude(s) => FileLayout::Prelude(Box::new(s.finalise_layout(
                 memory_offsets,
                 resolutions_out,
                 resources,
-            )?),
+            )?)),
             Self::Epilogue(s) => {
-                FileLayout::Epilogue(s.finalise_layout(memory_offsets, resources)?)
+                FileLayout::Epilogue(Box::new(s.finalise_layout(memory_offsets, resources)?))
             }
-            Self::SyntheticSymbols(s) => FileLayout::SyntheticSymbols(s.finalise_layout(
-                memory_offsets,
-                resolutions_out,
-                resources,
-            )?),
+            Self::SyntheticSymbols(s) => FileLayout::SyntheticSymbols(Box::new(
+                s.finalise_layout(memory_offsets, resolutions_out, resources)?,
+            )),
             Self::Dynamic(s) => s.finalise_layout(memory_offsets, resolutions_out, resources)?,
             Self::StubLibrary(s) => {
                 s.finalise_layout(memory_offsets, resolutions_out, resources)?
@@ -4431,7 +4466,7 @@ fn new_object_layout_state<P: Platform>(
     // significant work here. Do work when activate is called instead. Doing it there also means
     // that we don't do the work unless the object is actually needed.
 
-    FileLayoutState::Object(ObjectLayoutState {
+    FileLayoutState::Object(Box::new(ObjectLayoutState {
         file_id: input_state.common.file_id,
         symbol_id_range: input_state.common.symbol_id_range,
         section_id_range: input_state.section_id_range,
@@ -4445,21 +4480,21 @@ fn new_object_layout_state<P: Platform>(
         thunk_block_id: ThunkBlockId::default(),
         owns_thunk_block: false,
         post_gc_primary_bytes: 0,
-    })
+    }))
 }
 
 fn new_dynamic_object_layout_state<'data, P: Platform>(
     input_state: &resolution::ResolvedDynamic<'data, P>,
     args: &P::Args,
 ) -> FileLayoutState<'data, P> {
-    FileLayoutState::Dynamic(DynamicLayoutState {
+    FileLayoutState::Dynamic(Box::new(DynamicLayoutState {
         file_id: input_state.common.file_id,
         symbol_id_range: input_state.common.symbol_id_range,
         lib_name: input_state.lib_name(),
         object: input_state.common.object,
         input: input_state.common.input,
         format_specific: P::new_dynamic_layout_state_ext(input_state, args),
-    })
+    }))
 }
 
 impl<'data, P: Platform> ObjectLayoutState<'data, P> {
@@ -5271,7 +5306,7 @@ impl<'data, P: Platform> StubLibraryLayoutState<'data, P> {
         Ok(
             match P::finalise_layout_stub(self, memory_offsets, resources, resolutions_out)? {
                 Some(format_specific) => {
-                    FileLayout::StubLibrary(StubLibraryLayout { format_specific })
+                    FileLayout::StubLibrary(Box::new(StubLibraryLayout { format_specific }))
                 }
                 None => FileLayout::NotLoaded,
             },
@@ -5309,20 +5344,20 @@ pub(crate) fn default_create_resolutions<'data, P: Platform>(
 impl<'data, P: Platform> resolution::ResolvedFile<'data, P> {
     fn create_layout_state(self, args: &P::Args) -> FileLayoutState<'data, P> {
         match self {
-            resolution::ResolvedFile::Object(s) => new_object_layout_state(s),
+            resolution::ResolvedFile::Object(s) => new_object_layout_state(*s),
             resolution::ResolvedFile::Dynamic(s) => new_dynamic_object_layout_state(&s, args),
             resolution::ResolvedFile::StubLibrary(s) => {
-                FileLayoutState::StubLibrary(StubLibraryLayoutState::new(&s, args))
+                FileLayoutState::StubLibrary(Box::new(StubLibraryLayoutState::new(&s, args)))
             }
             resolution::ResolvedFile::Prelude(s) => {
-                FileLayoutState::Prelude(PreludeLayoutState::new(s, args))
+                FileLayoutState::Prelude(Box::new(PreludeLayoutState::new(*s, args)))
             }
             resolution::ResolvedFile::NotLoaded(s) => FileLayoutState::NotLoaded(s),
             resolution::ResolvedFile::LinkerScript(s) => {
-                FileLayoutState::LinkerScript(LinkerScriptLayoutState::new(s))
+                FileLayoutState::LinkerScript(Box::new(LinkerScriptLayoutState::new(*s)))
             }
             resolution::ResolvedFile::SyntheticSymbols(s) => {
-                FileLayoutState::SyntheticSymbols(SyntheticSymbolsLayoutState::new(s))
+                FileLayoutState::SyntheticSymbols(Box::new(SyntheticSymbolsLayoutState::new(*s)))
             }
             #[cfg(feature = "plugins")]
             resolution::ResolvedFile::LtoInput(s) => FileLayoutState::NotLoaded(NotLoaded {
@@ -6617,14 +6652,14 @@ impl<'data, P: Platform> DynamicLayoutState<'data, P> {
         Ok(
             match P::finalise_layout_dynamic(&mut self, memory_offsets, resources, resolutions_out)?
             {
-                Some(format_specific) => FileLayout::Dynamic(DynamicLayout {
+                Some(format_specific) => FileLayout::Dynamic(Box::new(DynamicLayout {
                     file_id,
                     input: self.input,
                     lib_name: self.lib_name,
                     object: self.object,
                     symbol_id_range: self.symbol_id_range,
                     format_specific,
-                }),
+                })),
                 None => FileLayout::NotLoaded,
             },
         )
@@ -7068,6 +7103,37 @@ fn harvest_and_sort_script_sections<'data, P: Platform>(
 
     if !has_any_sorting {
         return Vec::new();
+    }
+
+    if P::BUCKET_SORTED_SECTIONS {
+        // Traversing section slots preserves input order within each subsection name.
+        let mut by_rank: Vec<Vec<InputSortedSection>> = Vec::new();
+        for group in group_states {
+            for file in &group.files {
+                let FileLayoutState::Object(obj) = file else {
+                    continue;
+                };
+                for (index, slot) in obj.sections.iter().enumerate() {
+                    let SectionSlot::Sorted(sec) = slot else {
+                        continue;
+                    };
+                    let index = object::SectionIndex(index);
+                    let part_id = obj.section_part_id(index, section_part_ids);
+                    let rank = P::section_sort_rank(obj.object.section(index).unwrap());
+                    if rank >= by_rank.len() {
+                        by_rank.resize_with(rank + 1, Vec::new);
+                    }
+                    by_rank[rank].push(InputSortedSection {
+                        file_id: obj.file_id,
+                        section_index: index,
+                        part_id,
+                        size: sec.section.capacity(part_id, output_sections),
+                        alignment: part_id.alignment(output_sections),
+                    });
+                }
+            }
+        }
+        return by_rank.into_iter().flatten().collect();
     }
 
     let mut sections_out = Vec::new();

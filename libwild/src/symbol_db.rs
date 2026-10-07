@@ -77,6 +77,7 @@ pub struct SymbolDb<'data, P: Platform> {
     pub(crate) groups: Vec<Group<'data, P>>,
     pub(crate) extra_required_symbols: Vec<&'data [u8]>,
     fallback_aliases: HashMap<&'data [u8], &'data [u8]>,
+    coalesced_optional_inputs: PassThroughHashMap<&'data [u8], ()>,
 
     buckets: Vec<SymbolBucket<'data>>,
 
@@ -134,6 +135,9 @@ struct SymbolBucket<'data> {
 
     /// Global symbols that have multiple definitions keyed by the first symbol with that name.
     alternative_definitions: HashMap<SymbolId, Vec<SymbolId>>,
+    preferred_definitions: HashMap<SymbolId, SymbolId>,
+    dirty_preferred: Vec<SymbolId>,
+    cache_preferred: bool,
 
     /// Alternative definitions, but only for versioned symbols. This might be more efficient with
     /// a proper multi-map that doesn't need a separate Vec for each value, however we don't
@@ -357,6 +361,9 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
             name_to_id: Default::default(),
             versioned_name_to_id: Default::default(),
             alternative_definitions: HashMap::new(),
+            preferred_definitions: HashMap::new(),
+            dirty_preferred: Vec::new(),
+            cache_preferred: P::CACHE_PREFERRED_SYMBOLS,
             alternative_versioned_definitions: HashMap::new(),
         });
 
@@ -369,6 +376,7 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
             groups: Vec::new(),
             extra_required_symbols: Vec::new(),
             fallback_aliases: HashMap::new(),
+            coalesced_optional_inputs: Default::default(),
             start_stop_symbol_names: Default::default(),
             version_script,
             export_list,
@@ -400,6 +408,26 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
 
         let mut parsed_objects: Vec<Box<crate::parsing::ParsedInputObject<'data, P>>> =
             loaded.objects.into_iter().try_collect()?;
+        {
+            timing_phase!("Coalesce optional inputs");
+            let input_count = parsed_objects.len();
+            // Validate every input first, then retain the earliest equivalent candidate, including
+            // across resolver waves. Mandatory inputs must still be activated independently.
+            parsed_objects.retain(|parsed| {
+                if parsed.input.has_archive_semantics()
+                    && !parsed.modifiers.whole_archive
+                    && parsed.object.permits_optional_input_coalescing()
+                {
+                    let bytes = parsed.input.data();
+                    self.coalesced_optional_inputs
+                        .insert(PreHashed::new(bytes, hash_bytes(bytes)), ())
+                        .is_none()
+                } else {
+                    true
+                }
+            });
+            tracing::debug!(target: "metrics", input_objects = input_count, coalesced_objects = input_count - parsed_objects.len(), "optional_input_coalescing");
+        }
         {
             timing_phase!("Prepare input objects");
             let results: Vec<_> = parsed_objects
@@ -494,6 +522,35 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
                 }
             },
         );
+
+        if P::CACHE_PREFERRED_SYMBOLS {
+            let preferred: Vec<Vec<(SymbolId, SymbolId)>> = self
+                .buckets
+                .par_iter()
+                .map(|bucket| {
+                    let mut dirty = bucket.dirty_preferred.clone();
+                    dirty.sort_unstable();
+                    dirty.dedup();
+                    dirty
+                        .into_iter()
+                        .map(|first| {
+                            (
+                                first,
+                                P::preferred_symbol_candidate(
+                                    self,
+                                    first,
+                                    &bucket.alternative_definitions[&first],
+                                ),
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+            for (bucket, preferred) in self.buckets.iter_mut().zip(preferred) {
+                bucket.preferred_definitions.extend(preferred);
+                bucket.dirty_preferred.clear();
+            }
+        }
 
         Ok(())
     }
@@ -838,6 +895,23 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
         self.symbol_file_ids[symbol_id.as_usize()]
     }
 
+    pub(crate) fn initial_symbol_flags(
+        &self,
+        object: &SequencedInputObject<'data, P>,
+        symbol: &P::SymtabEntry,
+    ) -> ValueFlags {
+        RegularObjectSymbolLoader::<P> {
+            object: &object.parsed.object,
+            args: self.args,
+            version_script: &self.version_script,
+            archive_semantics: object.parsed.input.has_archive_semantics(),
+            lib_name: object.parsed.input.lib_name(),
+            export_list: self.export_list.as_ref(),
+            output_kind: self.output_kind,
+        }
+        .compute_value_flags(symbol)
+    }
+
     /// Returns whether the supplied symbol ID is the canonical ID. A symbol won't be canonical, if
     /// it resolves to a different symbol. The symbol may still be undefined.
     pub(crate) fn is_canonical(&self, symbol_id: SymbolId) -> bool {
@@ -959,14 +1033,16 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
         let num_buckets = self.buckets.len();
         let bucket = &self.buckets[prehashed.hash() as usize % num_buckets];
         if let Some(&first) = bucket.name_to_id.get(prehashed) {
-            return Some(
-                bucket
-                    .alternative_definitions
-                    .get(&first)
-                    .map_or(first, |alternatives| {
-                        P::preferred_symbol_candidate(self, first, alternatives)
-                    }),
-            );
+            return Some(bucket.alternative_definitions.get(&first).map_or(
+                first,
+                |alternatives| {
+                    bucket
+                        .preferred_definitions
+                        .get(&first)
+                        .copied()
+                        .unwrap_or_else(|| P::preferred_symbol_candidate(self, first, alternatives))
+                },
+            ));
         }
         self.fallback_aliases
             .get(prehashed.bytes())
@@ -1320,6 +1396,9 @@ impl<'data> SymbolBucket<'data> {
     }
 
     fn add_extra_symbol_definition(&mut self, first_symbol_id: SymbolId, new_symbol_id: SymbolId) {
+        if self.cache_preferred {
+            self.dirty_preferred.push(first_symbol_id);
+        }
         self.alternative_definitions
             .entry(first_symbol_id)
             .or_default()
@@ -1934,7 +2013,12 @@ trait SymbolLoader<'data, P: Platform> {
 
             let info = self.get_symbol_name_and_version(symbol, local_index)?;
 
-            let name = UnversionedSymbolName::prehashed(info.name());
+            let name = PreHashed::new(
+                UnversionedSymbolName::new(info.name()),
+                self.object()
+                    .symbol_name_hash(symbol)
+                    .unwrap_or_else(|| info.name_hash()),
+            );
 
             if self.should_downgrade_to_local(&name) {
                 flags |= ValueFlags::DOWNGRADE_TO_LOCAL;

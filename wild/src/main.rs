@@ -1,4 +1,4 @@
-#[cfg(feature = "mimalloc")]
+#[cfg(all(not(feature = "dhat"), any(windows, feature = "mimalloc")))]
 #[global_allocator]
 static MIMALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -34,6 +34,14 @@ fn run() -> libwild::error::Result {
         // Note, we need to setup tracing before worker, otherwise the threads won't contribute to
         // counters such as --time=cycles,instructions etc.
         libwild::setup_tracing(&args)?;
+
+        if cfg!(windows)
+            && matches!(&args, libwild::Args::Coff(_))
+            && !cfg!(feature = "dhat")
+            && option_env!("WILD_FULL_CLEANUP").is_none()
+        {
+            libwild::run_and_exit(args);
+        }
 
         libwild::run(args)
     }

@@ -82,6 +82,7 @@ pub(super) struct Section {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Symbol {
     pub name: ByteRange,
+    pub name_hash: u64,
     pub section: i32,
     pub value: u32,
     pub class: u8,
@@ -98,28 +99,90 @@ impl Symbol {
 #[derive(Debug, Default)]
 pub(super) struct Object {
     pub sections: Vec<Section>,
-    pub symbols: Vec<Symbol>,
+    pub symbols: SymbolTable<'static>,
     pub directives: Vec<String>,
     pub child_offsets: Vec<usize>,
     pub children: Vec<usize>,
 }
 
+#[derive(Debug)]
+pub(crate) enum SymbolTable<'data> {
+    Full(Vec<Symbol>),
+    Borrowed(&'data [Symbol]),
+    Catalog {
+        slots: Vec<u32>,
+        entries: Vec<Symbol>,
+    },
+}
+
+impl Default for SymbolTable<'_> {
+    fn default() -> Self {
+        Self::Full(Vec::new())
+    }
+}
+
+impl From<Vec<Symbol>> for SymbolTable<'_> {
+    fn from(symbols: Vec<Symbol>) -> Self {
+        Self::Full(symbols)
+    }
+}
+
+impl SymbolTable<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Full(symbols) => symbols.len(),
+            Self::Borrowed(symbols) => symbols.len(),
+            Self::Catalog { slots, .. } => slots.len(),
+        }
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &Symbol> {
+        match self {
+            Self::Full(symbols) => itertools::Either::Left(symbols.iter()),
+            Self::Borrowed(symbols) => itertools::Either::Left(symbols.iter()),
+            Self::Catalog { slots, entries } => {
+                itertools::Either::Right(slots.iter().map(|&index| &entries[index as usize]))
+            }
+        }
+    }
+    pub fn get(&self, index: usize) -> Option<&Symbol> {
+        match self {
+            Self::Full(symbols) => symbols.get(index),
+            Self::Borrowed(symbols) => symbols.get(index),
+            Self::Catalog { slots, entries } => {
+                slots.get(index).map(|&index| &entries[index as usize])
+            }
+        }
+    }
+}
+
+impl std::ops::Index<usize> for SymbolTable<'_> {
+    type Output = Symbol;
+    fn index(&self, index: usize) -> &Symbol {
+        self.get(index).expect("Invalid COFF symbol index")
+    }
+}
+
+pub(super) struct Catalog {
+    pub symbols: SymbolTable<'static>,
+    pub excluded: Vec<bool>,
+}
+
 #[derive(Clone, Debug)]
-pub(crate) struct Import {
-    pub symbol: String,
-    pub dll: String,
-    pub name: Option<String>,
+pub(crate) struct Import<'data> {
+    pub symbol: &'data str,
+    pub dll: &'data str,
+    pub name: Option<&'data str>,
     pub ordinal: u16,
     pub code: bool,
 }
 
-pub(super) enum Parsed {
+pub(super) enum Parsed<'data> {
     Object(Object),
-    Import(Import),
+    Import(Import<'data>),
     Metadata,
 }
 
-pub(super) fn parse(data: &[u8], name: String) -> Result<Parsed> {
+pub(super) fn parse(data: &[u8], name: String) -> Result<Parsed<'_>> {
     // Rust archive metadata is not a linkable object.
     if name.ends_with(".rmeta") || data.starts_with(b"rust") {
         return Ok(Parsed::Metadata);
@@ -141,12 +204,12 @@ pub(super) fn parse(data: &[u8], name: String) -> Result<Parsed> {
                 "Non-x64 import {name}"
             );
             let (import, ordinal) = match file.import() {
-                ImportName::Name(n) => (Some(std::str::from_utf8(n)?.to_owned()), 0),
+                ImportName::Name(n) => (Some(std::str::from_utf8(n)?), 0),
                 ImportName::Ordinal(n) => (None, n),
             };
             Ok(Parsed::Import(Import {
-                symbol: std::str::from_utf8(file.symbol())?.to_owned(),
-                dll: std::str::from_utf8(file.dll())?.to_owned(),
+                symbol: std::str::from_utf8(file.symbol())?,
+                dll: std::str::from_utf8(file.dll())?,
                 name: import,
                 ordinal,
                 code: file.import_type() == ImportType::Code,
@@ -154,6 +217,89 @@ pub(super) fn parse(data: &[u8], name: String) -> Result<Parsed> {
         }
         other => bail!("Unsupported COFF input format {other:?} in {name}"),
     }
+}
+
+/// Catalogs candidate definitions while preserving raw auxiliary-entry indices.
+pub(super) fn catalog(data: &[u8], name: &str) -> Result<Option<Catalog>> {
+    match kind(data)? {
+        object::FileKind::Coff => {
+            catalog_object::<pe::ImageFileHeader>(CoffFile::parse(data)?, data, name).map(Some)
+        }
+        object::FileKind::CoffBig => {
+            catalog_object(object::read::coff::CoffBigFile::parse(data)?, data, name).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn catalog_object<'a, C: CoffHeader>(
+    file: CoffFile<'a, &'a [u8], C>,
+    data: &'a [u8],
+    name: &str,
+) -> Result<Catalog> {
+    ensure!(
+        data.len() <= u32::MAX as usize,
+        "COFF object exceeds 4 GiB: {name}"
+    );
+    ensure!(
+        file.architecture() == object::Architecture::X86_64
+            || file.coff_header().machine() == pe::IMAGE_FILE_MACHINE_UNKNOWN,
+        "Non-x64 object {name}"
+    );
+    let excluded: Vec<_> = file
+        .sections()
+        .map(|section| {
+            let name = section.name()?;
+            let flags = section.coff_section().characteristics.get(LE).0;
+            Ok(flags & 0x02000800 != 0
+                || name.starts_with(".debug")
+                || matches!(name, ".drectve" | ".llvm_addrsig"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let table = file.coff_symbol_table();
+    let mut slots = vec![0; table.len()];
+    let mut entries = vec![Symbol::default()];
+    for (index, symbol) in table.iter() {
+        let class = symbol.storage_class().0;
+        let section = symbol.section_number().0;
+        let value = symbol.value();
+        if class != 105 && (class != 2 || (section == 0 && value == 0)) {
+            continue;
+        }
+        let bytes = symbol.name(table.strings())?;
+        std::str::from_utf8(bytes)?;
+        ensure!(
+            section <= excluded.len() as i32,
+            "Invalid symbol section in {name}"
+        );
+        let weak = if class == 105 && symbol.number_of_aux_symbols() > 0 {
+            let aux = table.aux_weak_external(index)?;
+            let fallback = aux.weak_default_sym_index.get(LE);
+            ensure!(
+                (fallback as usize) < table.len(),
+                "Invalid weak fallback in {name}"
+            );
+            Some((
+                NonZeroU32::new(fallback + 1).unwrap(),
+                aux.weak_search_type.get(LE).0,
+            ))
+        } else {
+            None
+        };
+        slots[index.0] = u32::try_from(entries.len())?;
+        entries.push(Symbol {
+            name: byte_range(data, bytes),
+            name_hash: crate::hash::hash_bytes(bytes),
+            section,
+            value,
+            class,
+            weak,
+        });
+    }
+    Ok(Catalog {
+        symbols: SymbolTable::Catalog { slots, entries },
+        excluded,
+    })
 }
 
 fn parse_object<'a, C: CoffHeader>(
@@ -211,6 +357,11 @@ fn parse_object<'a, C: CoffHeader>(
         std::str::from_utf8(symbol_name)?;
         let s = Symbol {
             name: byte_range(data, symbol_name),
+            name_hash: if matches!(symbol.storage_class().0, 2 | 105) {
+                crate::hash::hash_bytes(symbol_name)
+            } else {
+                0
+            },
             section: symbol.section_number().0,
             value: symbol.value(),
             class: symbol.storage_class().0,
@@ -317,7 +468,7 @@ fn parse_object<'a, C: CoffHeader>(
     }
     Ok(Object {
         sections,
-        symbols,
+        symbols: symbols.into(),
         directives,
         child_offsets,
         children,

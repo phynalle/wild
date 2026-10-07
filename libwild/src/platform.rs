@@ -1104,6 +1104,14 @@ pub(crate) trait Platform:
     /// should be excluded from name resolution. `true` for ELF (`STN_UNDEF`).
     const HAS_NULL_SYMBOL_ENTRY: bool = false;
 
+    const CACHE_PREFERRED_SYMBOLS: bool = false;
+    /// Uses dense ranks in section-name order instead of repeatedly comparing names.
+    const BUCKET_SORTED_SECTIONS: bool = false;
+
+    fn section_sort_rank(_section: &Self::SectionHeader) -> usize {
+        0
+    }
+
     fn preferred_symbol_candidate(
         _db: &SymbolDb<Self>,
         first: SymbolId,
@@ -1224,6 +1232,18 @@ pub(crate) trait ObjectFile<'data>: Sized + Send + Sync + std::fmt::Debug + 'dat
 
     fn is_dynamic(&self) -> bool;
 
+    /// Completes a deferred archive member after the shared resolver selects it.
+    /// Returns true when symbol metadata must be initialized from the completed object.
+    fn materialize(&self) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Allows byte-identical optional archive inputs to share their first candidate. Opt in only
+    /// for inputs without local references, directives or independently selected section data.
+    fn permits_optional_input_coalescing(&self) -> bool {
+        false
+    }
+
     fn num_symbols(&self) -> usize;
 
     fn enumerate_symbols(
@@ -1252,6 +1272,10 @@ pub(crate) trait ObjectFile<'data>: Sized + Send + Sync + std::fmt::Debug + 'dat
         &self,
         symbol: &<Self::Platform as Platform>::SymtabEntry,
     ) -> Result<&'data [u8]>;
+
+    fn symbol_name_hash(&self, _symbol: &<Self::Platform as Platform>::SymtabEntry) -> Option<u64> {
+        None
+    }
 
     // Get the offset of a symbol relative to the section identified by `section_index`.
     fn symbol_offset_in_section(
@@ -1525,6 +1549,17 @@ pub(crate) trait RawSymbolName<'data>: Send + Sync + std::fmt::Display + 'data {
     fn parse(bytes: &'data [u8]) -> Self;
 
     fn name(&self) -> &'data [u8];
+
+    fn name_hash(&self) -> u64 {
+        crate::hash::hash_bytes(self.name())
+    }
+
+    fn with_name_hash(self, _hash: Option<u64>) -> Self
+    where
+        Self: Sized,
+    {
+        self
+    }
 
     fn version_name(&self) -> Option<&'data [u8]>;
 

@@ -27,6 +27,9 @@ mimalloc = { workspace = true, optional = true }
 
 dhat = { workspace = true, optional = true }
 
+[target.'cfg(windows)'.dependencies]
+mimalloc.workspace = true
+
 [dev-dependencies]
 ar.workspace = true
 bitflags.workspace = true
